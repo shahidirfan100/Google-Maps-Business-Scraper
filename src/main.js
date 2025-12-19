@@ -28,6 +28,48 @@ const cleanHours = (text) => {
         .trim();
 };
 
+const parseRating = (text) => {
+    if (!text || typeof text !== 'string') return null;
+    const cleaned = text.replace('\u200E', '');
+    const match = cleaned.match(/(\d+[\.,]?\d*)/);
+    if (!match) return null;
+    const value = parseFloat(match[1].replace(',', '.'));
+    if (Number.isNaN(value) || value < 0 || value > 5) return null;
+    return value;
+};
+
+const parseReviewsCount = (text) => {
+    if (!text || typeof text !== 'string') return null;
+    const match = text.match(/([\d,\.\s]+)\s*(reviews|review)?/i) || text.match(/\(?([\d,]+)\)?/);
+    if (!match || !match[1]) return null;
+    const value = parseInt(match[1].replace(/[^\d]/g, ''), 10);
+    return Number.isNaN(value) ? null : value;
+};
+
+const parseCoordsFromUrl = (url) => {
+    if (!url || typeof url !== 'string') return { latitude: null, longitude: null };
+    const atMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+    if (atMatch) {
+        return {
+            latitude: parseFloat(atMatch[1]),
+            longitude: parseFloat(atMatch[2]),
+        };
+    }
+    const dataMatch = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+    if (dataMatch) {
+        return {
+            latitude: parseFloat(dataMatch[1]),
+            longitude: parseFloat(dataMatch[2]),
+        };
+    }
+    return { latitude: null, longitude: null };
+};
+
+const canonicalizePlaceUrl = (url) => {
+    if (!url || typeof url !== 'string') return url;
+    return url.split('?')[0];
+};
+
 const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
     const container = await page.$(containerSelector);
     if (!container) return;
@@ -50,8 +92,7 @@ const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
             if (element) element.scrollTo(0, element.scrollHeight);
         }, containerSelector);
 
-        // slightly increased wait to allow dynamic content to render
-        await page.waitForTimeout(1400);
+        await page.waitForTimeout(900);
 
         const newHeight = await page.evaluate((sel) => {
             const element = document.querySelector(sel);
@@ -70,23 +111,6 @@ const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
     }
 };
 
-// Helper: wait for any selector from a list within totalTimeout ms
-const waitForAnySelector = async (page, selectors, totalTimeout = 20000, pollInterval = 300) => {
-    const start = Date.now();
-    while (Date.now() - start < totalTimeout) {
-        for (const sel of selectors) {
-            try {
-                const exists = await page.$(sel);
-                if (exists) return sel;
-            } catch (e) {
-                // ignore
-            }
-        }
-        await page.waitForTimeout(pollInterval);
-    }
-    throw new Error(`None of selectors matched within ${totalTimeout}ms: ${selectors.join(', ')}`);
-};
-
 await Actor.init();
 
 const startTime = Date.now();
@@ -101,6 +125,7 @@ const {
     language = 'en',
     maxConcurrency = 5,
     proxyConfiguration,
+    fastMode = true,
 } = input;
 
 if (!Array.isArray(searchQueries) || searchQueries.length === 0) {
@@ -118,7 +143,7 @@ if (validQueries.length === 0) {
 
 console.log(`Starting Google Maps Business Scraper`);
 console.log(`Queries: ${validQueries.length} | Max results per query: ${maxResults}`);
-console.log(`Include reviews: ${includeReviews} | Include images: ${includeImages}`);
+console.log(`Include reviews: ${includeReviews} | Include images: ${includeImages} | Fast mode: ${fastMode}`);
 
 const startUrls = validQueries.map((query) => {
     const encodedQuery = encodeURIComponent(query);
@@ -132,11 +157,14 @@ const proxyConf = await Actor.createProxyConfiguration(
     proxyConfiguration || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
 );
 
+const seenBusinessUrls = new Set();
+
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxyConf,
     maxConcurrency,
     useSessionPool: true,
     sessionPoolOptions: {
+        persistCookiesPerSession: true,
         sessionOptions: {
             maxUsageCount: 12,
         },
@@ -151,6 +179,10 @@ const crawler = new PlaywrightCrawler({
             },
         },
     },
+    gotoOptions: {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+    },
     launchContext: {
         useChrome: Actor.isAtHome(),
         launchOptions: {
@@ -159,10 +191,9 @@ const crawler = new PlaywrightCrawler({
             args: ['--disable-blink-features=AutomationControlled'],
         },
     },
-    // increased timeouts and retries for slow-loading place pages
-    navigationTimeoutSecs: 60,
-    requestHandlerTimeoutSecs: 180,
-    maxRequestRetries: 3,
+    navigationTimeoutSecs: 45,
+    requestHandlerTimeoutSecs: 90,
+    maxRequestRetries: 2,
     maxRequestsPerCrawl: maxResults * validQueries.length + 100,
     preNavigationHooks: [
         async ({ page, request }) => {
@@ -177,18 +208,24 @@ const crawler = new PlaywrightCrawler({
 
                 await page.route('**/*', (route) => {
                     const resourceType = route.request().resourceType();
+                    const url = route.request().url();
                     if (resourceType === 'font' || resourceType === 'media' || resourceType === 'stylesheet') {
                         return route.abort();
                     }
                     if (page.__gmapsBlockImages && resourceType === 'image') {
                         return route.abort();
                     }
+                    if (!includeReviews && resourceType === 'xhr' && /review/i.test(url)) {
+                        return route.abort();
+                    }
                     return route.continue();
                 });
             }
 
-            page.__gmapsBlockImages = !includeImages || request.userData?.label === 'SEARCH';
+            page.__gmapsBlockImages = fastMode || !includeImages || request.userData?.label === 'SEARCH';
 
+            page.setDefaultTimeout(12000);
+            page.setDefaultNavigationTimeout(45000);
             await page.setExtraHTTPHeaders({
                 'accept-language': language ? `${language},en;q=0.8` : 'en-US,en;q=0.8',
             });
@@ -208,15 +245,22 @@ const crawler = new PlaywrightCrawler({
             });
 
             log.info(`Found ${businessLinks.length} businesses for query: ${query}`);
-            const limitedLinks = businessLinks.slice(0, maxResults);
+            const limitedLinks = [];
+            for (const detailUrl of businessLinks) {
+                const key = canonicalizePlaceUrl(detailUrl);
+                if (seenBusinessUrls.has(key)) continue;
+                seenBusinessUrls.add(key);
+                limitedLinks.push(detailUrl);
+                if (limitedLinks.length >= maxResults) break;
+            }
 
-            for (const detailUrl of limitedLinks) {
-                await crawler.addRequests([
-                    {
+            if (limitedLinks.length > 0) {
+                await crawler.addRequests(
+                    limitedLinks.map((detailUrl) => ({
                         url: detailUrl,
                         userData: { label: 'DETAIL', query, businessUrl: detailUrl },
-                    },
-                ]);
+                    })),
+                );
             }
             return;
         }
@@ -224,222 +268,152 @@ const crawler = new PlaywrightCrawler({
         if (label === 'DETAIL') {
             log.info(`Extracting business details from: ${businessUrl}`);
 
-            // Wait for any primary heading or common title element. Use a fallback helper when pages load slower or selectors change
             try {
-                await waitForAnySelector(page, ['h1', 'h1 span', 'div[role="heading"]', 'h2', 'div[role="main"] h1'], 22000);
+                await page.waitForSelector('h1', { timeout: 12000 });
             } catch (err) {
-                log.warning(`Primary heading not found within timeout; will attempt fallback extraction: ${err.message}`);
-                // Retry once by reloading the page (helps in cases of transient loading failures)
-                try {
-                    await page.reload({ timeout: 45000 });
-                    await waitForAnySelector(page, ['h1', 'h1 span', 'div[role="heading"]', 'h2', 'div[role="main"] h1'], 22000);
-                } catch (rerr) {
-                    log.debug(`Retry after reload failed: ${rerr.message}`);
-                }
+                log.debug(`Heading wait timed out: ${err.message}`);
             }
-            await page.waitForTimeout(900);
 
-            const trySelectors = async (selectors) => {
-                for (const sel of selectors) {
-                    try {
-                        const el = await page.locator(sel).first();
-                        if ((await el.count()) === 0) continue;
-                        const txt = await el.textContent().catch(() => null);
-                        if (txt && txt.trim().length > 0) return txt.trim();
-                    } catch (e) {
-                        /* continue */
+            const extracted = await page.evaluate((captureImages) => {
+                const pickText = (selectors) => {
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.textContent) {
+                            const txt = el.textContent.trim();
+                            if (txt) return txt;
+                        }
                     }
-                }
-                return null;
-            };
+                    return null;
+                };
 
-            const tryAttr = async (selectors, attr = 'href') => {
-                for (const sel of selectors) {
-                    try {
-                        const el = await page.locator(sel).first();
-                        if ((await el.count()) === 0) continue;
-                        const val = await el.getAttribute(attr).catch(() => null);
+                const pickAttr = (selectors, attr) => {
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const val = el.getAttribute(attr);
                         if (val) return val;
-                    } catch (e) {
-                        /* continue */
+                    }
+                    return null;
+                };
+
+                const name = pickText(['h1', 'h1 span', 'div[role="main"] h1']);
+                const category = pickText([
+                    'button[jsaction*="category"]',
+                    'button[aria-label*="Category"]',
+                    'div[role="main"] button:nth-of-type(1)',
+                ]);
+                const ratingText =
+                    pickAttr(['span[aria-label*="stars"]', 'div.F7nice span[aria-label*="stars"]'], 'aria-label') ||
+                    pickText(['span.ceNzKf', 'span.MW4etd', 'div.F7nice span[aria-hidden="true"]']);
+                const reviewsText =
+                    pickAttr(['button[aria-label*="review"]', 'button[aria-label*="reviews"]'], 'aria-label') ||
+                    pickText(['div.F7nice span:last-child', 'span.UY7F9', 'button[jsaction*="reviews"]']);
+                const address = pickText([
+                    'button[data-item-id="address"]',
+                    'button[aria-label*="Address"]',
+                    'button[aria-label*="address"]',
+                ]);
+                const phone = pickText([
+                    'button[data-item-id*="phone"]',
+                    'button[aria-label*="Phone"]',
+                    'a[href^="tel:"]',
+                ]);
+                const website = pickAttr(['a[data-item-id="authority"]', 'a[aria-label*="Website"]'], 'href');
+
+                let hours = null;
+                const hoursButton = document.querySelector('button[data-item-id*="hours"]');
+                if (hoursButton) hours = hoursButton.getAttribute('aria-label');
+                if (!hours) hours = pickText(['div[data-item-id*="hours"] .fontBodyMedium']);
+                if (!hours) hours = pickAttr(['button[aria-label*="hours" i]'], 'aria-label');
+                if (!hours) {
+                    const regionText = pickText(['div[role="region"]']);
+                    if (regionText && /\d{1,2}.*[AP]M/i.test(regionText)) hours = regionText;
+                }
+
+                const imageUrls = new Set();
+                if (captureImages) {
+                    const imgNodes = document.querySelectorAll('button[aria-label*="Photo"] img, div[role="img"] img');
+                    for (const img of imgNodes) {
+                        const src =
+                            img.getAttribute('src') ||
+                            img.getAttribute('data-src') ||
+                            img.getAttribute('data-iurl') ||
+                            img.getAttribute('data-lazy-src');
+                        if (src && src.startsWith('http')) imageUrls.add(src);
+                        if (imageUrls.size >= 5) break;
+                    }
+
+                    if (imageUrls.size < 5) {
+                        const bgNodes = document.querySelectorAll('div[role="img"][style*="url("]');
+                        for (const node of bgNodes) {
+                            const style = node.getAttribute('style') || '';
+                            const match = style.match(/url\("?(https?:[^")]+)"?\)/);
+                            if (match && match[1]) imageUrls.add(match[1]);
+                            if (imageUrls.size >= 5) break;
+                        }
                     }
                 }
-                return null;
+
+                return {
+                    name,
+                    category,
+                    ratingText,
+                    reviewsText,
+                    address,
+                    phone,
+                    website,
+                    hours,
+                    images: Array.from(imageUrls),
+                };
+            }, includeImages);
+
+            const rating = parseRating(extracted.ratingText);
+            const reviewsCount = parseReviewsCount(extracted.reviewsText);
+
+            let coords = parseCoordsFromUrl(businessUrl);
+            if (!coords.latitude || !coords.longitude) {
+                coords = parseCoordsFromUrl(page.url());
+            }
+
+            const businessData = {
+                name: cleanText(extracted.name) || undefined,
+                category: cleanText(extracted.category) || undefined,
+                address: cleanText(extracted.address) || undefined,
+                phone: cleanText(extracted.phone) || undefined,
+                website: extracted.website || undefined,
+                rating: rating !== null ? rating : undefined,
+                reviewsCount: reviewsCount !== null ? reviewsCount : undefined,
+                latitude: coords.latitude || undefined,
+                longitude: coords.longitude || undefined,
+                hours: cleanHours(extracted.hours) || undefined,
+                images: includeImages && extracted.images.length > 0 ? extracted.images : undefined,
             };
 
-            const name = (await trySelectors(['h1', 'h1 span', 'div[role="main"] h1'])) || null;
-
-            const category = await trySelectors([
-                'button[jsaction*="category"]',
-                'button[aria-label*="Category"]',
-                'div[role="main"] button:nth-of-type(1)',
-            ]);
-
-            let rating = null;
-            const ratingSelectors = [
-                'div[role="article"] span[aria-hidden="true"]',
-                'span[aria-label*="stars"]',
-                'span.ceNzKf',
-                'div.F7nice span[aria-hidden="true"]',
-                'span.MW4etd',
-            ];
-            for (const sel of ratingSelectors) {
+            if (!businessData.name) {
                 try {
-                    const txt = await page.locator(sel).first().textContent().catch(() => null);
-                    if (txt) {
-                        const cleaned = txt.replace('\u200E', '');
-                        const m = cleaned.match(/(\d+[\.,]?\d*)/);
-                        if (m) {
-                            const v = parseFloat(m[1].replace(',', '.'));
-                            if (!Number.isNaN(v) && v >= 0 && v <= 5) {
-                                rating = v;
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) {
-                    /* continue */
-                }
-            }
-
-            let reviewsCount = null;
-            const reviewsSelectors = [
-                'button[aria-label*="review"]',
-                'button[aria-label*="reviews"]',
-                'div.F7nice span:last-child',
-                'span.UY7F9',
-                'button[jsaction*="reviews"]',
-            ];
-            for (const sel of reviewsSelectors) {
-                try {
-                    const el = await page.locator(sel).first();
-                    if ((await el.count()) === 0) continue;
-                    const txt = await el.textContent().catch(() => null);
-                    if (txt) {
-                        const m = txt.match(/([\d,\.\s]+)\s*(reviews|review)?/i) || txt.match(/\(?([\d,]+)\)?/);
-                        if (m && m[1]) {
-                            const num = parseInt(m[1].replace(/[^\d]/g, ''), 10);
-                            if (!Number.isNaN(num)) {
-                                reviewsCount = num;
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) {
-                    /* continue */
-                }
-            }
-
-            const address = await trySelectors([
-                'button[data-item-id="address"]',
-                'button[aria-label*="Address"]',
-                'button[aria-label*="address"]',
-            ]);
-            const phone = await trySelectors([
-                'button[data-item-id*="phone"]',
-                'button[aria-label*="Phone"]',
-                'a[href^="tel:"]',
-            ]);
-            const website = await tryAttr(['a[data-item-id="authority"]', 'a[aria-label*="Website"]'], 'href');
-
-            let latitude = null;
-            let longitude = null;
-            try {
-                const url = page.url();
-                const coords = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-                if (coords) {
-                    latitude = parseFloat(coords[1]);
-                    longitude = parseFloat(coords[2]);
-                }
-            } catch (e) {
-                /* ignore */
-            }
-
-            let hours = null;
-            try {
-                const hoursButton = page.locator('button[data-item-id*="hours"]').first();
-                if ((await hoursButton.count()) > 0) {
-                    hours = await hoursButton.getAttribute('aria-label').catch(() => null);
-                }
-                if (!hours) {
-                    hours = await page.locator('div[data-item-id*="hours"] .fontBodyMedium').first().textContent().catch(() => null);
-                }
-                if (!hours) {
-                    hours = await page.locator('button[aria-label*="hours" i]').first().getAttribute('aria-label').catch(() => null);
-                }
-                if (!hours) {
-                    const hoursPattern = await page.locator('div[role="region"] >> text=/\d{1,2}.*[AP]M/i').first().textContent().catch(() => null);
-                    if (hoursPattern) hours = hoursPattern;
-                }
-            } catch (e) {
-                log.warning(`Hours extraction error: ${e.message}`);
-            }
-
-            // If primary heading is missing, attempt fallback extraction to avoid costly reclaiming
-            if (!name) {
-                try {
-                    // try page title and meta tags for a fallback name
                     const pgTitle = await page.title().catch(() => null);
                     if (pgTitle && pgTitle.trim().length) {
                         businessData.name = cleanText(pgTitle.split('-')[0]);
                     } else {
-                        try {
                         const metaEl = await page.$('meta[property="og:title"],meta[name="title"]');
                         if (metaEl) {
                             const content = await metaEl.getAttribute('content').catch(() => null);
                             if (content) businessData.name = cleanText(content);
                         }
-                    } catch (metaErr) {
-                        /* ignore */
-                    }
                     }
                 } catch (err) {
                     log.debug(`Fallback title extraction failed: ${err.message}`);
                 }
             }
 
-            let images = [];
-            if (includeImages) {
-                try {
-                    const imgHandles = await page
-                        .locator('button[aria-label*="Photo"] img, div[role="img"] img')
-                        .elementHandles()
-                        .catch(() => []);
-                    for (const h of imgHandles.slice(0, 5)) {
-                        try {
-                            const src = await h.getAttribute('src');
-                            if (src && src.startsWith('http')) images.push(src);
-                        } catch (e) {
-                            /* ignore */
-                        }
-                    }
-                } catch (e) {
-                    /* ignore */
-                }
-            }
-
-            const businessData = {
-                name: cleanText(name) || undefined,
-                category: cleanText(category) || undefined,
-                address: cleanText(address) || undefined,
-                phone: cleanText(phone) || undefined,
-                website: website || undefined,
-                rating: rating !== null ? rating : undefined,
-                reviewsCount: reviewsCount !== null ? reviewsCount : undefined,
-                latitude: latitude || undefined,
-                longitude: longitude || undefined,
-                hours: cleanHours(hours) || undefined,
-                images: images.length > 0 ? images : undefined,
-            };
-
-            // assign businessData early to allow fallback name assignment if 'name' was not found
-            if (!businessData.name && name) businessData.name = cleanText(name);
             if (includeReviews && businessData.reviewsCount && businessData.reviewsCount > 0) {
                 try {
-                    const reviewsButton = await page.$('button[aria-label*="Reviews"]');
-                    if (reviewsButton) {
-                        await reviewsButton.click();
-                        await page.waitForTimeout(2000);
+                    const reviewsButton = page
+                        .locator('button[aria-label*="Reviews" i], button[jsaction*="reviews"]')
+                        .first();
+                    if ((await reviewsButton.count()) > 0) {
+                        await reviewsButton.click({ timeout: 3000 });
+                        await page.waitForSelector('div[data-review-id]', { timeout: 5000 });
                         const reviews = await page.$$eval('div[data-review-id] span[lang]', (elements) => {
                             return elements.map((el) => el.textContent.trim()).slice(0, 10);
                         });
@@ -448,8 +422,6 @@ const crawler = new PlaywrightCrawler({
                 } catch (err) {
                     log.warning(`Failed to extract reviews: ${err.message}`);
                 }
-            } else {
-                // If reviews are not requested or unavailable, gracefully continue without failing
             }
 
             businessData.url = businessUrl;
@@ -539,6 +511,7 @@ const runStats = {
         includeImages,
         language,
         maxConcurrency,
+        fastMode,
     },
     timestamp: new Date().toISOString(),
     runtimeMs,
