@@ -1,0 +1,87 @@
+{
+  "title": "Google Maps Business Scraper",
+  "description": "Stealth Playwright scraper for Google Maps business profiles with optional reviews and images.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "searchQueries": {
+      "title": "Search Queries",
+      "type": "array",
+      "description": "List of Google Maps search queries (e.g., 'cardiologist in New York', 'coffee shop seattle').",
+      "editor": "stringList",
+      "items": {
+        "type": "string"
+      },
+      "default": [
+        "cardiologist",
+        "coffee shop seattle"
+      ],
+      "prefill": [
+        "cardiologist",
+        "coffee shop seattle"
+      ]
+    },
+    "maxResults": {
+      "title": "Max Results per Query",
+      "type": "integer",
+      "description": "Maximum businesses to extract for each query (1-500).",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 20,
+      "prefill": 20,
+      "editor": "number"
+    },
+    "includeReviews": {
+      "title": "Extract Reviews Snippets",
+      "type": "boolean",
+      "description": "Collect up to 10 recent review snippets when available.",
+      "default": false,
+      "prefill": false,
+      "editor": "checkbox"
+    },
+    "includeImages": {
+      "title": "Collect Images",
+      "type": "boolean",
+      "description": "Capture up to 5 image URLs per place.",
+      "default": true,
+      "prefill": true,
+      "editor": "checkbox"
+    },
+    "language": {
+      "title": "Language",
+      "type": "string",
+      "description": "Interface language code (e.g., en, fr).",
+      "default": "en",
+      "prefill": "en",
+      "editor": "textfield"
+    },
+    "maxConcurrency": {
+      "title": "Max Concurrency",
+      "type": "integer",
+      "description": "Parallel browser pages (balance speed vs. blocking).",
+      "minimum": 1,
+      "default": 5,
+      "prefill": 5,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Use Apify Proxy (residential recommended) for Google Maps stability.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
+      },
+      "prefill": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
+      }
+    }
+  },
+  "required": ["searchQueries"]
+}

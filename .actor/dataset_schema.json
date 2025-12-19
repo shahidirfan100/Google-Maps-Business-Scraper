@@ -1,0 +1,58 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "name",
+          "category",
+          "rating",
+          "reviewsCount",
+          "address",
+          "phone",
+          "website",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Business",
+            "format": "text"
+          },
+          "category": {
+            "label": "Category",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "reviewsCount": {
+            "label": "Reviews",
+            "format": "number"
+          },
+          "address": {
+            "label": "Address",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "website": {
+            "label": "Website",
+            "format": "link"
+          },
+          "url": {
+            "label": "Place URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "searchQueries": [
+    "cardiologist",
+    "coffee shop seattle"
+  ],
+  "maxResults": 20,
+  "includeReviews": false,
+  "includeImages": true,
+  "language": "en",
+  "maxConcurrency": 5,
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
+  }
+}
