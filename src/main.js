@@ -50,7 +50,8 @@ const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
             if (element) element.scrollTo(0, element.scrollHeight);
         }, containerSelector);
 
-        await page.waitForTimeout(900);
+        // slightly increased wait to allow dynamic content to render
+        await page.waitForTimeout(1400);
 
         const newHeight = await page.evaluate((sel) => {
             const element = document.querySelector(sel);
@@ -67,6 +68,23 @@ const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
         previousHeight = newHeight;
         scrollAttempts += 1;
     }
+};
+
+// Helper: wait for any selector from a list within totalTimeout ms
+const waitForAnySelector = async (page, selectors, totalTimeout = 20000, pollInterval = 300) => {
+    const start = Date.now();
+    while (Date.now() - start < totalTimeout) {
+        for (const sel of selectors) {
+            try {
+                const exists = await page.$(sel);
+                if (exists) return sel;
+            } catch (e) {
+                // ignore
+            }
+        }
+        await page.waitForTimeout(pollInterval);
+    }
+    throw new Error(`None of selectors matched within ${totalTimeout}ms: ${selectors.join(', ')}`);
 };
 
 await Actor.init();
@@ -141,9 +159,10 @@ const crawler = new PlaywrightCrawler({
             args: ['--disable-blink-features=AutomationControlled'],
         },
     },
-    navigationTimeoutSecs: 45,
-    requestHandlerTimeoutSecs: 90,
-    maxRequestRetries: 2,
+    // increased timeouts and retries for slow-loading place pages
+    navigationTimeoutSecs: 60,
+    requestHandlerTimeoutSecs: 180,
+    maxRequestRetries: 3,
     maxRequestsPerCrawl: maxResults * validQueries.length + 100,
     preNavigationHooks: [
         async ({ page, request }) => {
@@ -205,7 +224,19 @@ const crawler = new PlaywrightCrawler({
         if (label === 'DETAIL') {
             log.info(`Extracting business details from: ${businessUrl}`);
 
-            await page.waitForSelector('h1', { timeout: 12000 });
+            // Wait for any primary heading or common title element. Use a fallback helper when pages load slower or selectors change
+            try {
+                await waitForAnySelector(page, ['h1', 'h1 span', 'div[role="heading"]', 'h2', 'div[role="main"] h1'], 22000);
+            } catch (err) {
+                log.warning(`Primary heading not found within timeout; will attempt fallback extraction: ${err.message}`);
+                // Retry once by reloading the page (helps in cases of transient loading failures)
+                try {
+                    await page.reload({ timeout: 45000 });
+                    await waitForAnySelector(page, ['h1', 'h1 span', 'div[role="heading"]', 'h2', 'div[role="main"] h1'], 22000);
+                } catch (rerr) {
+                    log.debug(`Retry after reload failed: ${rerr.message}`);
+                }
+            }
             await page.waitForTimeout(900);
 
             const trySelectors = async (selectors) => {
@@ -344,6 +375,29 @@ const crawler = new PlaywrightCrawler({
                 log.warning(`Hours extraction error: ${e.message}`);
             }
 
+            // If primary heading is missing, attempt fallback extraction to avoid costly reclaiming
+            if (!name) {
+                try {
+                    // try page title and meta tags for a fallback name
+                    const pgTitle = await page.title().catch(() => null);
+                    if (pgTitle && pgTitle.trim().length) {
+                        businessData.name = cleanText(pgTitle.split('-')[0]);
+                    } else {
+                        try {
+                        const metaEl = await page.$('meta[property="og:title"],meta[name="title"]');
+                        if (metaEl) {
+                            const content = await metaEl.getAttribute('content').catch(() => null);
+                            if (content) businessData.name = cleanText(content);
+                        }
+                    } catch (metaErr) {
+                        /* ignore */
+                    }
+                    }
+                } catch (err) {
+                    log.debug(`Fallback title extraction failed: ${err.message}`);
+                }
+            }
+
             let images = [];
             if (includeImages) {
                 try {
@@ -378,6 +432,8 @@ const crawler = new PlaywrightCrawler({
                 images: images.length > 0 ? images : undefined,
             };
 
+            // assign businessData early to allow fallback name assignment if 'name' was not found
+            if (!businessData.name && name) businessData.name = cleanText(name);
             if (includeReviews && businessData.reviewsCount && businessData.reviewsCount > 0) {
                 try {
                     const reviewsButton = await page.$('button[aria-label*="Reviews"]');
@@ -392,6 +448,8 @@ const crawler = new PlaywrightCrawler({
                 } catch (err) {
                     log.warning(`Failed to extract reviews: ${err.message}`);
                 }
+            } else {
+                // If reviews are not requested or unavailable, gracefully continue without failing
             }
 
             businessData.url = businessUrl;
