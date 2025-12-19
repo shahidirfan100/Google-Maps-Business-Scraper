@@ -28,28 +28,42 @@ const cleanHours = (text) => {
         .trim();
 };
 
-const autoScroll = async (page, containerSelector, maxItems) => {
+const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
     const container = await page.$(containerSelector);
     if (!container) return;
 
     let previousHeight = 0;
     let scrollAttempts = 0;
-    const maxScrollAttempts = Math.ceil(maxItems / 20);
+    let stableCount = 0;
+    const maxScrollAttempts = Math.max(3, Math.ceil(maxItems / 12));
 
     while (scrollAttempts < maxScrollAttempts) {
+        if (itemSelector) {
+            const currentCount = await page.$$eval(itemSelector, (links) => {
+                return new Set(links.map((link) => link.href)).size;
+            });
+            if (currentCount >= maxItems) break;
+        }
+
         await page.evaluate((sel) => {
             const element = document.querySelector(sel);
             if (element) element.scrollTo(0, element.scrollHeight);
         }, containerSelector);
 
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(900);
 
         const newHeight = await page.evaluate((sel) => {
             const element = document.querySelector(sel);
             return element ? element.scrollHeight : 0;
         }, containerSelector);
 
-        if (newHeight === previousHeight) break;
+        if (newHeight === previousHeight) {
+            stableCount += 1;
+        } else {
+            stableCount = 0;
+        }
+        if (stableCount >= 2) break;
+
         previousHeight = newHeight;
         scrollAttempts += 1;
     }
@@ -103,6 +117,13 @@ const proxyConf = await Actor.createProxyConfiguration(
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxyConf,
     maxConcurrency,
+    useSessionPool: true,
+    sessionPoolOptions: {
+        persistCookiesPerSession: true,
+        sessionOptions: {
+            maxUsageCount: 12,
+        },
+    },
     browserPoolOptions: {
         useFingerprints: true,
         fingerprintOptions: {
@@ -118,21 +139,51 @@ const crawler = new PlaywrightCrawler({
         launchOptions: {
             headless: true,
             devtools: false,
-            args: ['--disable-blink-features=AutomationControlled', '--disable-web-security'],
+            args: ['--disable-blink-features=AutomationControlled'],
         },
     },
-    navigationTimeoutSecs: 60,
-    requestHandlerTimeoutSecs: 120,
-    maxRequestRetries: 3,
+    navigationTimeoutSecs: 45,
+    requestHandlerTimeoutSecs: 90,
+    maxRequestRetries: 2,
     maxRequestsPerCrawl: maxResults * validQueries.length + 100,
+    preNavigationHooks: [
+        async ({ page, request }) => {
+            if (!page.__gmapsStealthInit) {
+                page.__gmapsStealthInit = true;
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    window.chrome = { runtime: {} };
+                });
+
+                await page.route('**/*', (route) => {
+                    const resourceType = route.request().resourceType();
+                    if (resourceType === 'font' || resourceType === 'media' || resourceType === 'stylesheet') {
+                        return route.abort();
+                    }
+                    if (page.__gmapsBlockImages && resourceType === 'image') {
+                        return route.abort();
+                    }
+                    return route.continue();
+                });
+            }
+
+            page.__gmapsBlockImages = !includeImages || request.userData?.label === 'SEARCH';
+
+            await page.setExtraHTTPHeaders({
+                'accept-language': language ? `${language},en;q=0.8` : 'en-US,en;q=0.8',
+            });
+        },
+    ],
     async requestHandler({ page, request, log }) {
         const { label, query, businessUrl } = request.userData;
 
         if (label === 'SEARCH') {
             log.info(`Processing search: ${query}`);
             await page.waitForSelector('div[role="feed"]', { timeout: 30000 });
-            await page.waitForTimeout(3000);
-            await autoScroll(page, 'div[role="feed"]', maxResults);
+            await page.waitForTimeout(1200);
+            await autoScroll(page, 'div[role="feed"]', 'a[href*="/maps/place/"]', maxResults);
 
             const businessLinks = await page.$$eval('a[href*="/maps/place/"]', (links) => {
                 return [...new Set(links.map((link) => link.href))];
@@ -155,8 +206,8 @@ const crawler = new PlaywrightCrawler({
         if (label === 'DETAIL') {
             log.info(`Extracting business details from: ${businessUrl}`);
 
-            await page.waitForSelector('h1', { timeout: 15000 });
-            await page.waitForTimeout(3000);
+            await page.waitForSelector('h1', { timeout: 12000 });
+            await page.waitForTimeout(900);
 
             const trySelectors = async (selectors) => {
                 for (const sel of selectors) {

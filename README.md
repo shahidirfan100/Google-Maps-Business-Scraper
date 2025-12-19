@@ -1,17 +1,24 @@
 # Google Maps Business Scraper
 
-Extract local business profiles from Google Maps using a stealthy Playwright crawler. Ideal for lead generation, market research, and local SEO with optional review and image capture.
+[![Apify Actor](https://img.shields.io/badge/Apify-Actor-blue)](https://apify.com)  [![Data](https://img.shields.io/badge/Data-Local%20Businesses-green)](#)
 
-## What this actor does
+> Extract structured local business profiles from Google Maps with robust inputs, clear outputs, and reliable run-time reporting. This README follows Apify's actor guidelines: clear headings, usage examples, and configuration for fast onboarding and discoverability.
 
-- Launches Playwright with fingerprints and proxies to reduce blocking on Google Maps.
-- Scrolls local results, enqueues place pages, and extracts names, ratings, reviews, contacts, coordinates, and optional images.
-- Cleans text (strips emojis/special chars) and normalizes hours to keep outputs consistent.
-- Provides run statistics and status messages for Apify monitoring.
+---
 
-## Quick start
+## 📋 Overview
 
-Minimal cardiologist search:
+This actor collects local business information for lead generation, market research, local SEO, and competitive analysis. It's designed to be resilient to minor page updates and provides configurable options for results, concurrency, and optional enrichment (reviews, images).
+
+Key outputs include name, category, rating, reviews count, phone, website, coordinates, operating hours, images, and a link to the place.
+
+---
+
+## 🚀 Quick start
+
+Run the actor on the Apify platform and provide input via the UI or `INPUT.json`.
+
+Basic example (cardiologist search):
 
 ```json
 {
@@ -20,7 +27,7 @@ Minimal cardiologist search:
 }
 ```
 
-City-focused with images and reviews:
+City-scoped example with reviews and images:
 
 ```json
 {
@@ -31,32 +38,39 @@ City-focused with images and reviews:
 }
 ```
 
-Budget-friendly fast run:
+Multiple queries example (batch):
 
 ```json
 {
-  "searchQueries": ["plumber austin"],
-  "maxResults": 10,
-  "includeReviews": false,
-  "includeImages": false
+  "searchQueries": ["dentist boston", "plumber austin"],
+  "maxResults": 30,
+  "includeReviews": false
 }
 ```
 
-## Input parameters
+---
 
-| Name | Type | Description |
-| ---- | ---- | ----------- |
-| `searchQueries` | array<string> | Required list of search terms (e.g., `"cardiologist"`, `"coffee shop seattle"`). |
-| `maxResults` | integer | Maximum businesses per query (1-500). |
-| `includeReviews` | boolean | Capture up to 10 review snippets when available. |
-| `includeImages` | boolean | Save up to 5 image URLs per place. |
-| `language` | string | Interface language code (e.g., `en`, `fr`). |
-| `maxConcurrency` | integer | Parallel pages; tune for speed vs. blocking risk. |
-| `proxyConfiguration` | object | Proxy settings; Apify residential proxy recommended. |
+## ⚙️ Input parameters
 
-## Output
+Use the actor UI or `INPUT.json`. All fields are optional except `searchQueries`.
 
-Each dataset item includes:
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `searchQueries` | array[string] | required | One or more place search terms (e.g., `"cardiologist"`, `"coffee shop seattle"`). |
+| `maxResults` | integer | `20` | Max businesses per query (1–500). Reducing this improves speed and reduces blocks. |
+| `includeReviews` | boolean | `false` | Collect up to 10 short review snippets per place. |
+| `includeImages` | boolean | `true` | Save up to 5 image URLs per place when available. |
+| `language` | string | `en` | Language hint for results (e.g., `en`, `fr`). |
+| `maxConcurrency` | integer | `5` | Number of concurrent browser pages. Lower to reduce blocking risk. |
+| `proxyConfiguration` | object | recommended | Configure proxies in UI (`useApifyProxy: true`) for reliability on targeted sites. |
+
+> Tip: Start with `maxResults: 10` and low `maxConcurrency` when testing new queries or proxies.
+
+---
+
+## 📦 Output (dataset)
+
+Each item stored in the default dataset contains structured fields. Example:
 
 ```json
 {
@@ -64,7 +78,7 @@ Each dataset item includes:
   "category": "Cardiologist",
   "rating": 4.8,
   "reviewsCount": 152,
-  "address": "123 Main St, Anytown, TX 78701",
+  "address": "123 Main St, Anytown, TX",
   "phone": "+1 512-555-0100",
   "website": "https://cityheartclinic.example",
   "url": "https://www.google.com/maps/place/...",
@@ -74,29 +88,84 @@ Each dataset item includes:
   "images": ["https://.../image1.jpg"],
   "reviews": ["Great service", "Kind staff"],
   "searchQuery": "cardiologist",
-  "scrapedAt": "2025-01-19T10:00:00.000Z"
+  "scrapedAt": "2025-12-19T10:00:00.000Z"
 }
 ```
 
-## How it works
+Field notes:
 
-1) Launches Playwright with fingerprints, Chrome, and proxy support for stealthy navigation.
-2) Loads Google Maps search, scrolls the results feed, and collects place links up to `maxResults` per query.
-3) Visits each place page, extracting primary data; optionally clicks reviews and collects image URLs.
-4) Cleans text, normalizes hours, and stores results in the default dataset with run summaries.
+- `reviews`: present if `includeReviews` is enabled and reviews were found.
+- `images`: present when `includeImages` is enabled and images are available.
+- `url`: direct place link for manual verification.
 
-## Recommended settings
+---
 
-- Lead lists: `maxResults: 100`, `includeReviews: true`, `includeImages: true`, residential proxy.
-- Fast checks: `maxResults: 20`, `includeReviews: false`, `includeImages: false`.
-- High reliability: keep `maxConcurrency` modest (3-5) with residential proxies.
+## 🧭 How it works (concise)
 
-## Best practices
+1. Actor receives `searchQueries` via UI or `INPUT.json`.
+2. For each query, the actor navigates Google Maps search results and collects place links.
+3. It visits each place page and extracts data, with optional review/image capture.
+4. The actor stores results in the dataset and writes a run summary to the key-value store.
 
-- Start small to verify proxy health and selector stability.
-- Prefer residential proxies for sticky sessions and reduced blocks.
-- Keep queries specific (city + vertical) to reduce duplicates.
-- Avoid excessive concurrency; balance speed against Google rate limits.
+> The actor prioritizes stable data extraction and provides clear error reporting for failed requests.
+
+---
+
+## ✅ Best practices & configuration tips
+
+- Use residential proxies or platform proxy options for consistent access to results.
+- Narrow searches by adding city/region to reduce duplicates and increase relevance (e.g., `"coffee shop seattle"`).
+- Keep `maxConcurrency` at moderate levels (3–6) for stable runs.
+- If scraping large volumes, split queries into multiple runs to avoid signal spikes and reduce blocking.
+
+---
+
+## 🔧 Troubleshooting
+
+**No results or empty dataset**
+
+- Confirm `searchQueries` are valid and not too generic.
+- Try reducing `maxConcurrency` and `maxResults`.
+- Verify proxy health and region settings in the actor UI.
+
+**Partial data (missing phone/website)**
+
+- Not all places publish contact info; try `includeImages` and `includeReviews` to enrich output.
+- Run a single place URL (via `searchQueries`) to manually verify selectors and content availability.
+
+**Run slow or times out**
+
+- Decrease `maxResults` or `includeReviews`/`includeImages` to reduce per-page work.
+- Increase timeouts or reduce concurrency if experiencing frequent timeouts.
+
+---
+
+## 📈 Performance & cost considerations
+
+- Each place visit is a browser page load. Enabling reviews and images increases run time and resource usage.
+- Use `maxResults` and `maxConcurrency` to trade off between speed and reliability.
+
+---
+
+## 🔎 SEO & discoverability keywords
+
+Google Maps scraper, local business data, lead generation, business contact extraction, local SEO insights, place reviews, business images, location intelligence, place enrichment, local search data.
+
+---
+
+## 📝 Legal & usage notes
+
+- This actor extracts publicly available information. Always verify and comply with the source site's terms of service and applicable laws before using extracted data.
+
+---
+
+## 📞 Support & contribution
+
+If you encounter issues or need additional features, open an issue in the repository or add a comment to the actor on the platform with a reproducible example and the `INPUT.json` you used.
+
+---
+
+*Last updated: 2025-12-19*
 
 ## Troubleshooting
 
