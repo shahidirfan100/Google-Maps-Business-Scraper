@@ -119,7 +119,6 @@ const crawler = new PlaywrightCrawler({
     maxConcurrency,
     useSessionPool: true,
     sessionPoolOptions: {
-        persistCookiesPerSession: true,
         sessionOptions: {
             maxUsageCount: 12,
         },
