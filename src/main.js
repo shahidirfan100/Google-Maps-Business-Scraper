@@ -164,7 +164,6 @@ const crawler = new PlaywrightCrawler({
     maxConcurrency,
     useSessionPool: true,
     sessionPoolOptions: {
-        persistCookiesPerSession: true,
         sessionOptions: {
             maxUsageCount: 12,
         },
@@ -178,10 +177,6 @@ const crawler = new PlaywrightCrawler({
                 operatingSystems: ['windows', 'macos'],
             },
         },
-    },
-    gotoOptions: {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000,
     },
     launchContext: {
         useChrome: Actor.isAtHome(),
