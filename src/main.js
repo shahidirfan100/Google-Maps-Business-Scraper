@@ -46,7 +46,7 @@ const getRandomUserAgent = () => {
     return agents[Math.floor(Math.random() * agents.length)];
 };
 
-// Fast HTTP extraction for place details
+// Enhanced HTTP extraction for place details - extracts ALL available fields
 const extractPlaceHttp = async (url, proxyUrl, query, log) => {
     try {
         const response = await gotScraping({
@@ -57,8 +57,8 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
                 'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'en-US,en;q=0.9',
             },
-            timeout: { request: 15000 },
-            retry: { limit: 1 },
+            timeout: { request: 20000 },
+            retry: { limit: 2 },
         });
 
         if (response.statusCode !== 200) return null;
@@ -66,46 +66,102 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
         const $ = cheerio.load(response.body);
         const coords = parseCoordsFromUrl(url);
 
-        // Try JSON-LD first
-        let data = null;
+        // Extract from JSON-LD (most reliable)
+        let jsonLdData = null;
         $('script[type="application/ld+json"]').each((_, el) => {
             try {
                 const json = JSON.parse($(el).html());
-                if (json['@type']?.includes?.('LocalBusiness') || json['@type'] === 'LocalBusiness') {
-                    data = {
-                        name: json.name,
-                        address: json.address?.streetAddress || (typeof json.address === 'string' ? json.address : null),
-                        phone: json.telephone,
-                        website: json.url,
-                        rating: json.aggregateRating?.ratingValue,
-                        reviewsCount: json.aggregateRating?.reviewCount,
-                        latitude: json.geo?.latitude || coords.latitude,
-                        longitude: json.geo?.longitude || coords.longitude,
-                        category: Array.isArray(json['@type']) ? json['@type'][0] : json['@type'],
-                    };
+                if (json['@type']?.includes?.('LocalBusiness') || json['@type'] === 'LocalBusiness' ||
+                    json['@type']?.includes?.('Restaurant') || json['@type']?.includes?.('Store')) {
+                    jsonLdData = json;
                 }
             } catch { }
         });
 
-        if (data?.name) {
-            return { ...data, url, searchQuery: query, scrapedAt: new Date().toISOString() };
-        }
+        // Extract from page meta and content
+        const ogTitle = $('meta[property="og:title"]').attr('content') || '';
+        const ogDescription = $('meta[property="og:description"]').attr('content') || '';
+        const ogImage = $('meta[property="og:image"]').attr('content') || '';
+        const pageTitle = $('title').text() || '';
 
-        // Fallback: meta tags + title
-        const name = $('meta[property="og:title"]').attr('content')?.split(' - ')[0] ||
-            $('title').text().split(' - ')[0] ||
-            $('h1').first().text();
+        // Parse name from various sources
+        const name = cleanText(
+            jsonLdData?.name ||
+            ogTitle.split(' - ')[0] ||
+            pageTitle.split(' - ')[0] ||
+            $('h1').first().text()
+        );
 
-        if (!name?.trim()) return null;
+        if (!name) return null;
 
-        return {
-            name: cleanText(name),
-            latitude: coords.latitude,
-            longitude: coords.longitude,
+        // Build comprehensive business data
+        const businessData = {
+            // Basic info
+            name,
+            description: cleanText(ogDescription) || undefined,
+
+            // Category
+            category: cleanText(
+                jsonLdData?.['@type'] ?
+                    (Array.isArray(jsonLdData['@type']) ? jsonLdData['@type'].filter(t => t !== 'LocalBusiness')[0] : jsonLdData['@type']) :
+                    undefined
+            ) || undefined,
+
+            // Location
+            address: cleanText(
+                jsonLdData?.address?.streetAddress ||
+                (typeof jsonLdData?.address === 'string' ? jsonLdData.address : null)
+            ) || undefined,
+
+            city: cleanText(jsonLdData?.address?.addressLocality) || undefined,
+            state: cleanText(jsonLdData?.address?.addressRegion) || undefined,
+            postalCode: cleanText(jsonLdData?.address?.postalCode) || undefined,
+            country: cleanText(jsonLdData?.address?.addressCountry) || undefined,
+
+            // Coordinates
+            latitude: jsonLdData?.geo?.latitude || coords.latitude || undefined,
+            longitude: jsonLdData?.geo?.longitude || coords.longitude || undefined,
+
+            // Contact
+            phone: cleanText(jsonLdData?.telephone) || undefined,
+            website: jsonLdData?.url || jsonLdData?.sameAs?.[0] || undefined,
+
+            // Ratings
+            rating: parseRating(jsonLdData?.aggregateRating?.ratingValue) || undefined,
+            reviewsCount: parseReviewsCount(jsonLdData?.aggregateRating?.reviewCount) || undefined,
+
+            // Price
+            priceRange: cleanText(jsonLdData?.priceRange) || undefined,
+
+            // Hours
+            openingHours: jsonLdData?.openingHours ?
+                (Array.isArray(jsonLdData.openingHours) ? jsonLdData.openingHours.join(', ') : jsonLdData.openingHours) :
+                undefined,
+
+            // Images
+            mainImage: ogImage || jsonLdData?.image || undefined,
+
+            // Menu (for restaurants)
+            menuUrl: jsonLdData?.hasMenu || jsonLdData?.menu || undefined,
+
+            // Reservations
+            reservationUrl: jsonLdData?.acceptsReservations ? jsonLdData?.url : undefined,
+
+            // Social
+            socialLinks: jsonLdData?.sameAs || undefined,
+
+            // Meta
             url,
             searchQuery: query,
             scrapedAt: new Date().toISOString(),
         };
+
+        // Remove undefined values
+        Object.keys(businessData).forEach(key => {
+            if (businessData[key] === undefined) delete businessData[key];
+        });
+
+        return businessData;
     } catch (err) {
         log.debug(`HTTP extraction failed for ${url}: ${err.message}`);
         return null;
@@ -126,9 +182,8 @@ const processDetailsInParallel = async (urls, proxyConf, query, log, concurrency
         const batchResults = await Promise.all(promises);
         results.push(...batchResults.filter(r => r?.name));
 
-        // Small delay between batches
         if (i + concurrency < urls.length) {
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 150));
         }
     }
 
@@ -142,10 +197,15 @@ const input = (await Actor.getInput()) ?? {};
 const {
     searchQueries = ['coffee shop seattle'],
     maxResults = 10,
+    includeReviews = false,
+    includeImages = true,
     language = 'en',
     maxConcurrency = 2,
     proxyConfiguration,
 } = input;
+
+// Fast mode is always enabled internally
+const fastMode = true;
 
 if (!Array.isArray(searchQueries) || searchQueries.length === 0) {
     throw new Error('At least one search query is required');
@@ -156,8 +216,9 @@ if (validQueries.length === 0) {
     throw new Error('All search queries are empty');
 }
 
-console.log(`Starting Google Maps Scraper (Fast Mode)`);
+console.log(`Starting Google Maps Scraper`);
 console.log(`Queries: ${validQueries.length} | Max results: ${maxResults}`);
+console.log(`Include reviews: ${includeReviews} | Include images: ${includeImages}`);
 
 const proxyConf = await Actor.createProxyConfiguration(
     proxyConfiguration || { useApifyProxy: true, groups: ['RESIDENTIAL'] }
@@ -166,7 +227,6 @@ const proxyConf = await Actor.createProxyConfiguration(
 const allBusinessData = [];
 const seenUrls = new Set();
 
-// Use minimal Playwright only for search pages
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxyConf,
     maxConcurrency,
@@ -184,21 +244,22 @@ const crawler = new PlaywrightCrawler({
         },
     },
     navigationTimeoutSecs: 30,
-    requestHandlerTimeoutSecs: 60,
-    maxRequestRetries: 1,
+    requestHandlerTimeoutSecs: 90,
+    maxRequestRetries: 2,
     preNavigationHooks: [
         async ({ page }) => {
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             });
-            // Block everything except main document for speed
-            await page.route('**/*', (route) => {
-                const type = route.request().resourceType();
-                if (['image', 'stylesheet', 'font', 'media'].includes(type)) return route.abort();
-                if (/analytics|doubleclick|googletagmanager/i.test(route.request().url())) return route.abort();
-                return route.continue();
-            });
-            page.setDefaultTimeout(15000);
+            if (fastMode) {
+                await page.route('**/*', (route) => {
+                    const type = route.request().resourceType();
+                    if (['image', 'stylesheet', 'font', 'media'].includes(type)) return route.abort();
+                    if (/analytics|doubleclick|googletagmanager/i.test(route.request().url())) return route.abort();
+                    return route.continue();
+                });
+            }
+            page.setDefaultTimeout(20000);
         },
     ],
     async requestHandler({ page, request, log }) {
@@ -216,19 +277,19 @@ const crawler = new PlaywrightCrawler({
 
         // Wait for feed
         try {
-            await page.waitForSelector('div[role="feed"]', { timeout: 15000 });
+            await page.waitForSelector('div[role="feed"]', { timeout: 20000 });
         } catch {
             log.error(`Feed not found for: ${query}`);
             return;
         }
 
-        // Quick scroll to load results
-        for (let i = 0; i < 3; i++) {
+        // Scroll to load more results
+        for (let i = 0; i < Math.min(5, Math.ceil(maxResults / 8)); i++) {
             await page.evaluate(() => {
                 const feed = document.querySelector('div[role="feed"]');
                 if (feed) feed.scrollTo(0, feed.scrollHeight);
             });
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(400 + Math.random() * 200);
         }
 
         // Extract links
@@ -249,11 +310,11 @@ const crawler = new PlaywrightCrawler({
             }
         }
 
-        // Process ALL detail pages via HTTP in parallel (NO Playwright!)
+        // Process ALL detail pages via HTTP in parallel
         log.info(`Extracting ${uniqueLinks.length} businesses via HTTP...`);
         const results = await processDetailsInParallel(uniqueLinks, proxyConf, query, log, 10);
 
-        log.info(`Successfully extracted ${results.length} businesses`);
+        log.info(`Successfully extracted ${results.length} businesses with full details`);
         allBusinessData.push(...results);
     },
     async failedRequestHandler({ request, log }) {
@@ -261,7 +322,6 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
-// Create start URLs
 const startUrls = validQueries.map((query) => ({
     url: `https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=${language}`,
     userData: { query },
@@ -277,20 +337,33 @@ for (const data of allBusinessData) {
 // Summary
 const itemCount = allBusinessData.length;
 const withPhone = allBusinessData.filter(b => b.phone).length;
+const withWebsite = allBusinessData.filter(b => b.website).length;
+const withAddress = allBusinessData.filter(b => b.address).length;
+const withRating = allBusinessData.filter(b => b.rating).length;
 const avgRating = allBusinessData.filter(b => b.rating).reduce((s, b) => s + b.rating, 0) /
-    (allBusinessData.filter(b => b.rating).length || 1);
+    (withRating || 1);
 
 console.log('======================================================================');
 console.log('SCRAPING COMPLETED');
+console.log('======================================================================');
 console.log(`   Total businesses: ${itemCount}`);
-console.log(`   With phone: ${withPhone}`);
+console.log(`   With phone: ${withPhone} (${itemCount ? ((withPhone / itemCount) * 100).toFixed(0) : 0}%)`);
+console.log(`   With website: ${withWebsite} (${itemCount ? ((withWebsite / itemCount) * 100).toFixed(0) : 0}%)`);
+console.log(`   With address: ${withAddress} (${itemCount ? ((withAddress / itemCount) * 100).toFixed(0) : 0}%)`);
+console.log(`   With rating: ${withRating} (${itemCount ? ((withRating / itemCount) * 100).toFixed(0) : 0}%)`);
 console.log(`   Avg rating: ${avgRating.toFixed(2)}`);
 console.log(`   Runtime: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
 console.log('======================================================================');
 
 await Actor.setValue('OUTPUT', {
     totalBusinesses: itemCount,
-    successRate: '100%',
+    dataQuality: {
+        withPhone: `${withPhone}/${itemCount}`,
+        withWebsite: `${withWebsite}/${itemCount}`,
+        withAddress: `${withAddress}/${itemCount}`,
+        withRating: `${withRating}/${itemCount}`,
+        avgRating: avgRating.toFixed(2),
+    },
     runtimeMs: Date.now() - startTime,
 });
 

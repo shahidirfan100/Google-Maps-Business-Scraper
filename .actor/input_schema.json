@@ -62,14 +62,6 @@
       "prefill": 3,
       "editor": "number"
     },
-    "fastMode": {
-      "title": "Fast Mode",
-      "type": "boolean",
-      "description": "Skip loading images on search pages for faster performance and lower costs.",
-      "default": true,
-      "prefill": true,
-      "editor": "checkbox"
-    },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
