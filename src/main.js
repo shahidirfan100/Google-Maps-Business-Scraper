@@ -1,6 +1,9 @@
 import { Actor } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { PlaywrightCrawler, Dataset, RequestQueue } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import * as cheerio from 'cheerio';
 
+// Helper functions
 const cleanText = (text) => {
     if (!text || typeof text !== 'string') return '';
     return text
@@ -70,45 +73,97 @@ const canonicalizePlaceUrl = (url) => {
     return url.split('?')[0];
 };
 
-const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
-    const container = await page.$(containerSelector);
-    if (!container) return;
+// Generate random User-Agent
+const getRandomUserAgent = () => {
+    const userAgents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+};
 
-    let previousHeight = 0;
-    let scrollAttempts = 0;
-    let stableCount = 0;
-    const maxScrollAttempts = Math.max(3, Math.ceil(maxItems / 12));
+// Extract business data from place page HTML using cheerio
+const extractBusinessFromHtml = (html, url, query) => {
+    const $ = cheerio.load(html);
 
-    while (scrollAttempts < maxScrollAttempts) {
-        if (itemSelector) {
-            const currentCount = await page.$$eval(itemSelector, (links) => {
-                return new Set(links.map((link) => link.href)).size;
-            });
-            if (currentCount >= maxItems) break;
+    // Try to find JSON-LD data first
+    let businessData = null;
+    $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+            const json = JSON.parse($(el).html());
+            if (json['@type'] === 'LocalBusiness' || json['@type']?.includes('LocalBusiness')) {
+                businessData = {
+                    name: json.name,
+                    address: json.address?.streetAddress || json.address,
+                    phone: json.telephone,
+                    rating: json.aggregateRating?.ratingValue,
+                    reviewsCount: json.aggregateRating?.reviewCount,
+                    latitude: json.geo?.latitude,
+                    longitude: json.geo?.longitude,
+                    category: json['@type'],
+                    website: json.url,
+                };
+            }
+        } catch {
+            // Ignore JSON parse errors
         }
+    });
 
-        await page.evaluate((sel) => {
-            const element = document.querySelector(sel);
-            if (element) element.scrollTo(0, element.scrollHeight);
-        }, containerSelector);
+    if (businessData) {
+        return {
+            ...businessData,
+            url,
+            searchQuery: query,
+            scrapedAt: new Date().toISOString(),
+        };
+    }
 
-        const randomDelay = 800 + Math.floor(Math.random() * 400);
-        await page.waitForTimeout(randomDelay);
+    // Fallback to HTML parsing
+    const name = $('h1').first().text().trim() ||
+        $('meta[property="og:title"]').attr('content')?.split('-')[0]?.trim();
 
-        const newHeight = await page.evaluate((sel) => {
-            const element = document.querySelector(sel);
-            return element ? element.scrollHeight : 0;
-        }, containerSelector);
+    const coords = parseCoordsFromUrl(url);
 
-        if (newHeight === previousHeight) {
-            stableCount += 1;
-        } else {
-            stableCount = 0;
+    return {
+        name: cleanText(name),
+        url,
+        searchQuery: query,
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+        scrapedAt: new Date().toISOString(),
+    };
+};
+
+// Try HTTP-first extraction for place details
+const fetchPlaceDetailsHttp = async (url, proxyUrl, log) => {
+    try {
+        const response = await gotScraping({
+            url,
+            proxyUrl,
+            headers: {
+                'User-Agent': getRandomUserAgent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+            },
+            timeout: { request: 30000 },
+            retry: { limit: 2 },
+        });
+
+        if (response.statusCode === 200) {
+            log.debug(`HTTP fetch successful for: ${url}`);
+            return response.body;
         }
-        if (stableCount >= 2) break;
-
-        previousHeight = newHeight;
-        scrollAttempts += 1;
+        log.warning(`HTTP fetch returned ${response.statusCode} for: ${url}`);
+        return null;
+    } catch (err) {
+        log.debug(`HTTP fetch failed: ${err.message}`);
+        return null;
     }
 };
 
@@ -119,8 +174,8 @@ await Actor.setValue('START_TIME', startTime);
 
 const input = (await Actor.getInput()) ?? {};
 const {
-    searchQueries = ['coffee shops in San Francisco'],
-    maxResults = 20,
+    searchQueries = ['coffee shop seattle'],
+    maxResults = 10,
     includeReviews = false,
     includeImages = true,
     language = 'en',
@@ -146,28 +201,73 @@ console.log(`Starting Google Maps Business Scraper`);
 console.log(`Queries: ${validQueries.length} | Max results per query: ${maxResults}`);
 console.log(`Include reviews: ${includeReviews} | Include images: ${includeImages} | Fast mode: ${fastMode}`);
 
-const startUrls = validQueries.map((query) => {
-    const encodedQuery = encodeURIComponent(query);
-    return {
-        url: `https://www.google.com/maps/search/${encodedQuery}?hl=${language}`,
-        userData: { label: 'SEARCH', query },
-    };
-});
-
 const proxyConf = await Actor.createProxyConfiguration(
     proxyConfiguration || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
 );
 
 const seenBusinessUrls = new Set();
+const requestQueue = await RequestQueue.open();
+
+// Add search URLs to queue
+for (const query of validQueries) {
+    const encodedQuery = encodeURIComponent(query);
+    await requestQueue.addRequest({
+        url: `https://www.google.com/maps/search/${encodedQuery}?hl=${language}`,
+        userData: { label: 'SEARCH', query },
+    });
+}
+
+const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
+    const container = await page.$(containerSelector);
+    if (!container) return;
+
+    let previousHeight = 0;
+    let scrollAttempts = 0;
+    let stableCount = 0;
+    const maxScrollAttempts = Math.max(3, Math.ceil(maxItems / 12));
+
+    while (scrollAttempts < maxScrollAttempts) {
+        if (itemSelector) {
+            const currentCount = await page.$$eval(itemSelector, (links) => {
+                return new Set(links.map((link) => link.href)).size;
+            });
+            if (currentCount >= maxItems) break;
+        }
+
+        await page.evaluate((sel) => {
+            const element = document.querySelector(sel);
+            if (element) element.scrollTo(0, element.scrollHeight);
+        }, containerSelector);
+
+        const randomDelay = 600 + Math.floor(Math.random() * 300);
+        await page.waitForTimeout(randomDelay);
+
+        const newHeight = await page.evaluate((sel) => {
+            const element = document.querySelector(sel);
+            return element ? element.scrollHeight : 0;
+        }, containerSelector);
+
+        if (newHeight === previousHeight) {
+            stableCount += 1;
+        } else {
+            stableCount = 0;
+        }
+        if (stableCount >= 2) break;
+
+        previousHeight = newHeight;
+        scrollAttempts += 1;
+    }
+};
 
 const crawler = new PlaywrightCrawler({
+    requestQueue,
     proxyConfiguration: proxyConf,
     maxConcurrency,
     useSessionPool: true,
     sessionPoolOptions: {
         maxPoolSize: 10,
         sessionOptions: {
-            maxUsageCount: 5,
+            maxUsageCount: 3,
             maxErrorScore: 1,
         },
     },
@@ -175,9 +275,9 @@ const crawler = new PlaywrightCrawler({
         useFingerprints: true,
         fingerprintOptions: {
             fingerprintGeneratorOptions: {
-                browsers: ['chrome'],
+                browsers: ['firefox', 'chrome'],
                 devices: ['desktop'],
-                operatingSystems: ['windows', 'macos'],
+                operatingSystems: ['windows', 'macos', 'linux'],
             },
         },
     },
@@ -185,114 +285,49 @@ const crawler = new PlaywrightCrawler({
         useChrome: Actor.isAtHome(),
         launchOptions: {
             headless: true,
-            devtools: false,
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-site-isolation-trials',
-                '--disable-web-security',
                 '--no-first-run',
                 '--no-default-browser-check',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
                 '--window-size=1920,1080',
             ],
         },
     },
-    navigationTimeoutSecs: 60,
-    requestHandlerTimeoutSecs: 120,
+    navigationTimeoutSecs: 45,
+    requestHandlerTimeoutSecs: 90,
     maxRequestRetries: 2,
-    maxRequestsPerCrawl: maxResults * validQueries.length + 100,
     preNavigationHooks: [
         async ({ page, request }) => {
-            if (!page.__gmapsStealthInit) {
-                page.__gmapsStealthInit = true;
-                await page.addInitScript(() => {
-                    // Hide webdriver
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    delete navigator.__proto__.webdriver;
+            // Apply stealth
+            await page.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                window.chrome = { runtime: {}, loadTimes: () => { }, csi: () => { } };
+            });
 
-                    // Set realistic languages
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            // Block unnecessary resources for speed
+            await page.route('**/*', (route) => {
+                const resourceType = route.request().resourceType();
+                const url = route.request().url();
 
-                    // Fake plugins array
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => {
-                            const plugins = [
-                                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                                { name: 'Native Client', filename: 'internal-nacl-plugin' },
-                            ];
-                            plugins.length = 3;
-                            return plugins;
-                        }
-                    });
+                if (['font', 'media', 'stylesheet'].includes(resourceType)) {
+                    return route.abort();
+                }
+                if (request.userData?.label === 'SEARCH' && resourceType === 'image') {
+                    return route.abort();
+                }
+                if (/analytics|doubleclick|googletagmanager/i.test(url)) {
+                    return route.abort();
+                }
+                return route.continue();
+            });
 
-                    // Set proper platform
-                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-
-                    // Hide automation indicators
-                    window.chrome = {
-                        runtime: {},
-                        loadTimes: () => { },
-                        csi: () => { },
-                        app: {}
-                    };
-
-                    // Prevent detection via permissions
-                    const originalQuery = window.navigator.permissions?.query;
-                    if (originalQuery) {
-                        window.navigator.permissions.query = (parameters) => {
-                            if (parameters.name === 'notifications') {
-                                return Promise.resolve({ state: 'denied', onchange: null });
-                            }
-                            return originalQuery(parameters);
-                        };
-                    }
-
-                    // Set realistic screen properties
-                    Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-                    Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-                    Object.defineProperty(screen, 'width', { get: () => 1920 });
-                    Object.defineProperty(screen, 'height', { get: () => 1080 });
-                    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-                });
-
-                await page.route('**/*', (route) => {
-                    const resourceType = route.request().resourceType();
-                    const url = route.request().url();
-
-                    // Block unnecessary resources for speed and cost optimization
-                    if (['font', 'media', 'stylesheet'].includes(resourceType)) {
-                        return route.abort();
-                    }
-
-                    // Block images in fast mode or on search pages
-                    if (page.__gmapsBlockImages && resourceType === 'image') {
-                        return route.abort();
-                    }
-
-                    // Block review-related XHR if not collecting reviews
-                    if (!includeReviews && resourceType === 'xhr' && /review/i.test(url)) {
-                        return route.abort();
-                    }
-
-                    // Block analytics and tracking
-                    if (/analytics|doubleclick|google-analytics|googletagmanager/i.test(url)) {
-                        return route.abort();
-                    }
-
-                    return route.continue();
-                });
-            }
-
-            page.__gmapsBlockImages = fastMode || !includeImages || request.userData?.label === 'SEARCH';
-
-            page.setDefaultTimeout(15000);
-            page.setDefaultNavigationTimeout(60000);
+            page.setDefaultTimeout(20000);
+            page.setDefaultNavigationTimeout(45000);
             await page.setExtraHTTPHeaders({
-                'accept-language': language ? `${language},en;q=0.8` : 'en-US,en;q=0.8',
+                'accept-language': `${language},en;q=0.9`,
             });
         },
     ],
@@ -302,82 +337,44 @@ const crawler = new PlaywrightCrawler({
         if (label === 'SEARCH') {
             log.info(`Processing search: ${query}`);
 
-            // Handle Google consent dialog/cookie popup
+            // Handle consent dialogs
             try {
-                const consentSelectors = [
-                    'button[aria-label*="Accept all"]',
-                    'button[aria-label*="Reject all"]',
-                    'form[action*="consent"] button',
-                    'button:has-text("Accept all")',
-                    'button:has-text("Reject all")',
-                    '[aria-label="Accept all"]',
-                    'button.VfPpkd-LgbsSe[jsname]',
-                ];
-
-                for (const selector of consentSelectors) {
-                    try {
-                        const consentBtn = page.locator(selector).first();
-                        if (await consentBtn.isVisible({ timeout: 3000 })) {
-                            await consentBtn.click({ timeout: 5000 });
-                            log.info('Dismissed consent dialog');
-                            await page.waitForTimeout(2000);
-                            break;
-                        }
-                    } catch {
-                        // Ignore - try next selector
-                    }
+                const consentBtn = page.locator('button[aria-label*="Accept"], form[action*="consent"] button').first();
+                if (await consentBtn.isVisible({ timeout: 5000 })) {
+                    await consentBtn.click({ timeout: 3000 });
+                    log.info('Dismissed consent dialog');
+                    await page.waitForTimeout(1500);
                 }
-            } catch (err) {
-                log.debug(`Consent dialog check: ${err.message}`);
+            } catch {
+                // No consent dialog
             }
 
-            // Wait for page to stabilize after potential consent handling
-            await page.waitForLoadState('domcontentloaded');
-
-            // Try multiple selectors for the results feed
-            const feedSelectors = [
-                'div[role="feed"]',
-                'div[role="main"] div[role="feed"]',
-                'div.m6QErb[role="feed"]',
-                'div[aria-label*="Results"]',
-            ];
-
+            // Wait for feed with multiple selector fallbacks
+            const feedSelectors = ['div[role="feed"]', 'div.m6QErb', 'div[aria-label*="Results"]'];
             let feedFound = false;
+
             for (const selector of feedSelectors) {
                 try {
-                    await page.waitForSelector(selector, { timeout: 30000 });
+                    await page.waitForSelector(selector, { timeout: 20000 });
                     feedFound = true;
-                    log.info(`Feed found using selector: ${selector}`);
+                    log.info(`Feed found using: ${selector}`);
                     break;
                 } catch {
-                    log.debug(`Selector ${selector} not found, trying next...`);
+                    log.debug(`Selector ${selector} not found`);
                 }
             }
 
             if (!feedFound) {
-                // Check if we got blocked or page didn't load properly
-                const pageContent = await page.content();
-                if (pageContent.includes('unusual traffic') || pageContent.includes('captcha')) {
-                    log.error('Detected CAPTCHA or bot detection, session likely blocked');
-                    throw new Error('Bot detection triggered');
+                // Check for captcha/block
+                const content = await page.content();
+                if (content.includes('unusual traffic') || content.includes('captcha')) {
+                    throw new Error('Bot detection - retrying with new session');
                 }
-
-                // Try clicking search button if needed
-                const searchBox = await page.$('input[aria-label*="Search"]');
-                if (searchBox) {
-                    await searchBox.press('Enter');
-                    await page.waitForTimeout(3000);
-                    feedFound = await page.$('div[role="feed"]') !== null;
-                }
-
-                if (!feedFound) {
-                    log.error(`Feed not found after all attempts, skipping query: ${query}`);
-                    return;
-                }
+                log.error(`Feed not found, skipping: ${query}`);
+                return;
             }
 
-            const randomWait = 1000 + Math.floor(Math.random() * 500);
-            await page.waitForTimeout(randomWait);
+            await page.waitForTimeout(800 + Math.random() * 400);
             await autoScroll(page, 'div[role="feed"]', 'a[href*="/maps/place/"]', maxResults);
 
             const businessLinks = await page.$$eval('a[href*="/maps/place/"]', (links) => {
@@ -385,6 +382,7 @@ const crawler = new PlaywrightCrawler({
             });
 
             log.info(`Found ${businessLinks.length} businesses for query: ${query}`);
+
             const limitedLinks = [];
             for (const detailUrl of businessLinks) {
                 const key = canonicalizePlaceUrl(detailUrl);
@@ -394,194 +392,113 @@ const crawler = new PlaywrightCrawler({
                 if (limitedLinks.length >= maxResults) break;
             }
 
-            if (limitedLinks.length > 0) {
-                await crawler.addRequests(
-                    limitedLinks.map((detailUrl) => ({
-                        url: detailUrl,
-                        userData: { label: 'DETAIL', query, businessUrl: detailUrl },
-                    })),
-                );
+            // Add detail pages to queue
+            for (const detailUrl of limitedLinks) {
+                await requestQueue.addRequest({
+                    url: detailUrl,
+                    userData: { label: 'DETAIL', query, businessUrl: detailUrl },
+                });
             }
             return;
         }
 
         if (label === 'DETAIL') {
-            log.info(`Extracting business details from: ${businessUrl}`);
+            log.info(`Extracting: ${businessUrl}`);
 
-            try {
-                await page.waitForSelector('h1', { timeout: 15000 });
-            } catch (err) {
-                log.debug(`Heading wait timed out: ${err.message}`);
+            // Try HTTP first for faster extraction
+            const proxyUrl = await proxyConf.newUrl();
+            const httpHtml = await fetchPlaceDetailsHttp(businessUrl, proxyUrl, log);
+
+            let businessData = null;
+
+            if (httpHtml && httpHtml.includes('"@type"')) {
+                businessData = extractBusinessFromHtml(httpHtml, businessUrl, query);
+                if (businessData?.name) {
+                    log.info(`HTTP extracted: ${businessData.name}`);
+                }
             }
 
-            const extracted = await page.evaluate((captureImages) => {
-                const pickText = (selectors) => {
-                    for (const sel of selectors) {
-                        const el = document.querySelector(sel);
-                        if (el && el.textContent) {
-                            const txt = el.textContent.trim();
-                            if (txt) return txt;
-                        }
-                    }
-                    return null;
-                };
-
-                const pickAttr = (selectors, attr) => {
-                    for (const sel of selectors) {
-                        const el = document.querySelector(sel);
-                        if (!el) continue;
-                        const val = el.getAttribute(attr);
-                        if (val) return val;
-                    }
-                    return null;
-                };
-
-                const name = pickText(['h1', 'h1 span', 'div[role="main"] h1']);
-                const category = pickText([
-                    'button[jsaction*="category"]',
-                    'button[aria-label*="Category"]',
-                    'div[role="main"] button:nth-of-type(1)',
-                ]);
-                const ratingText =
-                    pickAttr(['span[aria-label*="stars"]', 'div.F7nice span[aria-label*="stars"]'], 'aria-label') ||
-                    pickText(['span.ceNzKf', 'span.MW4etd', 'div.F7nice span[aria-hidden="true"]']);
-                const reviewsText =
-                    pickAttr(['button[aria-label*="review"]', 'button[aria-label*="reviews"]'], 'aria-label') ||
-                    pickText(['div.F7nice span:last-child', 'span.UY7F9', 'button[jsaction*="reviews"]']);
-                const address = pickText([
-                    'button[data-item-id="address"]',
-                    'button[aria-label*="Address"]',
-                    'button[aria-label*="address"]',
-                ]);
-                const phone = pickText([
-                    'button[data-item-id*="phone"]',
-                    'button[aria-label*="Phone"]',
-                    'a[href^="tel:"]',
-                ]);
-                const website = pickAttr(['a[data-item-id="authority"]', 'a[aria-label*="Website"]'], 'href');
-
-                let hours = null;
-                const hoursButton = document.querySelector('button[data-item-id*="hours"]');
-                if (hoursButton) hours = hoursButton.getAttribute('aria-label');
-                if (!hours) hours = pickText(['div[data-item-id*="hours"] .fontBodyMedium']);
-                if (!hours) hours = pickAttr(['button[aria-label*="hours" i]'], 'aria-label');
-                if (!hours) {
-                    const regionText = pickText(['div[role="region"]']);
-                    if (regionText && /\d{1,2}.*[AP]M/i.test(regionText)) hours = regionText;
-                }
-
-                const imageUrls = new Set();
-                if (captureImages) {
-                    const imgNodes = document.querySelectorAll('button[aria-label*="Photo"] img, div[role="img"] img');
-                    for (const img of imgNodes) {
-                        const src =
-                            img.getAttribute('src') ||
-                            img.getAttribute('data-src') ||
-                            img.getAttribute('data-iurl') ||
-                            img.getAttribute('data-lazy-src');
-                        if (src && src.startsWith('http')) imageUrls.add(src);
-                        if (imageUrls.size >= 5) break;
-                    }
-
-                    if (imageUrls.size < 5) {
-                        const bgNodes = document.querySelectorAll('div[role="img"][style*="url("]');
-                        for (const node of bgNodes) {
-                            const style = node.getAttribute('style') || '';
-                            const match = style.match(/url\("?(https?:[^")]+)"?\)/);
-                            if (match && match[1]) imageUrls.add(match[1]);
-                            if (imageUrls.size >= 5) break;
-                        }
-                    }
-                }
-
-                return {
-                    name,
-                    category,
-                    ratingText,
-                    reviewsText,
-                    address,
-                    phone,
-                    website,
-                    hours,
-                    images: Array.from(imageUrls),
-                };
-            }, includeImages);
-
-            const rating = parseRating(extracted.ratingText);
-            const reviewsCount = parseReviewsCount(extracted.reviewsText);
-
-            let coords = parseCoordsFromUrl(businessUrl);
-            if (!coords.latitude || !coords.longitude) {
-                coords = parseCoordsFromUrl(page.url());
-            }
-
-            const businessData = {
-                name: cleanText(extracted.name) || undefined,
-                category: cleanText(extracted.category) || undefined,
-                address: cleanText(extracted.address) || undefined,
-                phone: cleanText(extracted.phone) || undefined,
-                website: extracted.website || undefined,
-                rating: rating !== null ? rating : undefined,
-                reviewsCount: reviewsCount !== null ? reviewsCount : undefined,
-                latitude: coords.latitude || undefined,
-                longitude: coords.longitude || undefined,
-                hours: cleanHours(extracted.hours) || undefined,
-                images: includeImages && extracted.images.length > 0 ? extracted.images : undefined,
-            };
-
-            if (!businessData.name) {
+            // If HTTP didn't work, use the Playwright page data
+            if (!businessData?.name) {
                 try {
-                    const pgTitle = await page.title().catch(() => null);
-                    if (pgTitle && pgTitle.trim().length) {
-                        businessData.name = cleanText(pgTitle.split('-')[0]);
-                    } else {
-                        const metaEl = await page.$('meta[property="og:title"],meta[name="title"]');
-                        if (metaEl) {
-                            const content = await metaEl.getAttribute('content').catch(() => null);
-                            if (content) businessData.name = cleanText(content);
+                    await page.waitForSelector('h1', { timeout: 15000 });
+                } catch {
+                    log.debug('h1 selector timeout, continuing...');
+                }
+
+                const extracted = await page.evaluate((captureImages) => {
+                    const pickText = (selectors) => {
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el?.textContent) return el.textContent.trim();
+                        }
+                        return null;
+                    };
+
+                    const pickAttr = (selectors, attr) => {
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            const val = el?.getAttribute(attr);
+                            if (val) return val;
+                        }
+                        return null;
+                    };
+
+                    const name = pickText(['h1', 'h1 span', 'div[role="main"] h1']);
+                    const category = pickText(['button[jsaction*="category"]', 'button[aria-label*="Category"]']);
+                    const ratingText = pickAttr(['span[aria-label*="stars"]'], 'aria-label') ||
+                        pickText(['span.ceNzKf', 'span.MW4etd']);
+                    const reviewsText = pickAttr(['button[aria-label*="review"]'], 'aria-label') ||
+                        pickText(['div.F7nice span:last-child']);
+                    const address = pickText(['button[data-item-id="address"]', 'button[aria-label*="Address"]']);
+                    const phone = pickText(['button[data-item-id*="phone"]', 'a[href^="tel:"]']);
+                    const website = pickAttr(['a[data-item-id="authority"]'], 'href');
+                    const hours = pickAttr(['button[data-item-id*="hours"]'], 'aria-label');
+
+                    const imageUrls = [];
+                    if (captureImages) {
+                        const imgs = document.querySelectorAll('button[aria-label*="Photo"] img');
+                        for (const img of imgs) {
+                            const src = img.src || img.dataset.src;
+                            if (src?.startsWith('http')) imageUrls.push(src);
+                            if (imageUrls.length >= 5) break;
                         }
                     }
-                } catch (err) {
-                    log.debug(`Fallback title extraction failed: ${err.message}`);
-                }
+
+                    return { name, category, ratingText, reviewsText, address, phone, website, hours, images: imageUrls };
+                }, includeImages);
+
+                const coords = parseCoordsFromUrl(businessUrl) || parseCoordsFromUrl(page.url());
+
+                businessData = {
+                    name: cleanText(extracted.name),
+                    category: cleanText(extracted.category) || undefined,
+                    address: cleanText(extracted.address) || undefined,
+                    phone: cleanText(extracted.phone) || undefined,
+                    website: extracted.website || undefined,
+                    rating: parseRating(extracted.ratingText),
+                    reviewsCount: parseReviewsCount(extracted.reviewsText),
+                    latitude: coords.latitude || undefined,
+                    longitude: coords.longitude || undefined,
+                    hours: cleanHours(extracted.hours) || undefined,
+                    images: includeImages && extracted.images?.length > 0 ? extracted.images : undefined,
+                    url: businessUrl,
+                    searchQuery: query,
+                    scrapedAt: new Date().toISOString(),
+                };
             }
 
-            if (includeReviews && businessData.reviewsCount && businessData.reviewsCount > 0) {
-                try {
-                    const reviewsButton = page
-                        .locator('button[aria-label*="Reviews" i], button[jsaction*="reviews"]')
-                        .first();
-                    if ((await reviewsButton.count()) > 0) {
-                        await reviewsButton.click({ timeout: 3000 });
-                        await page.waitForSelector('div[data-review-id]', { timeout: 5000 });
-                        const reviews = await page.$$eval('div[data-review-id] span[lang]', (elements) => {
-                            return elements.map((el) => el.textContent.trim()).slice(0, 10);
-                        });
-                        businessData.reviews = reviews.map((r) => cleanText(r)).filter((r) => r);
-                    }
-                } catch (err) {
-                    log.warning(`Failed to extract reviews: ${err.message}`);
-                }
-            }
-
-            businessData.url = businessUrl;
-            businessData.searchQuery = query;
-            businessData.scrapedAt = new Date().toISOString();
-
-            if (!businessData.name || businessData.name.trim().length === 0) {
-                log.warning(`Skipping business with no name: ${businessUrl}`);
+            if (!businessData?.name) {
+                log.warning(`Skipping - no name extracted: ${businessUrl}`);
                 return;
             }
 
             await Dataset.pushData(businessData);
-            log.info(
-                `Saved: ${businessData.name} | Rating: ${businessData.rating || 'N/A'} | Reviews: ${businessData.reviewsCount || 'N/A'
-                }`,
-            );
+            log.info(`Saved: ${businessData.name} | Rating: ${businessData.rating || 'N/A'}`);
         }
     },
     async failedRequestHandler({ request, log }) {
-        log.error(`Failed request: ${request.url} - Error: ${request.errorMessages?.join(', ') || 'Unknown error'}`);
+        log.error(`Failed: ${request.url}`);
         await Dataset.pushData({
             error: true,
             url: request.url,
@@ -592,8 +509,9 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
-await crawler.run(startUrls);
+await crawler.run();
 
+// Summary
 const dataset = await Dataset.open();
 const { items } = await dataset.getData();
 const successfulItems = items.filter((item) => !item.error);
@@ -602,29 +520,17 @@ const itemCount = successfulItems.length;
 
 const businessesWithPhone = successfulItems.filter((b) => b.phone).length;
 const businessesWithWebsite = successfulItems.filter((b) => b.website).length;
-const businessesWithReviews = successfulItems.filter((b) => b.reviewsCount && b.reviewsCount > 0).length;
-const avgRating =
-    successfulItems.filter((b) => b.rating).reduce((sum, b) => sum + b.rating, 0) /
+const avgRating = successfulItems.filter((b) => b.rating).reduce((sum, b) => sum + b.rating, 0) /
     (successfulItems.filter((b) => b.rating).length || 1);
 
 console.log('======================================================================');
 console.log('SCRAPING COMPLETED');
 console.log('======================================================================');
-console.log('RESULTS SUMMARY:');
 console.log(`   Total businesses extracted: ${itemCount}`);
-console.log(
-    `   Businesses with phone: ${businessesWithPhone} (${itemCount ? ((businessesWithPhone / itemCount) * 100).toFixed(1) : 0}%)`,
-);
-console.log(
-    `   Businesses with website: ${businessesWithWebsite} (${itemCount ? ((businessesWithWebsite / itemCount) * 100).toFixed(1) : 0}%)`,
-);
-console.log(
-    `   Businesses with reviews: ${businessesWithReviews} (${itemCount ? ((businessesWithReviews / itemCount) * 100).toFixed(1) : 0}%)`,
-);
+console.log(`   Businesses with phone: ${businessesWithPhone}`);
+console.log(`   Businesses with website: ${businessesWithWebsite}`);
 console.log(`   Average rating: ${avgRating.toFixed(2)}`);
 console.log(`   Failed requests: ${failedItems.length}`);
-console.log(`   Queries processed: ${validQueries.length}`);
-console.log('Data export available in JSON, CSV, Excel');
 console.log('======================================================================');
 
 const runtimeMs = Date.now() - startTime;
@@ -638,20 +544,10 @@ const runStats = {
     dataQuality: {
         withPhone: businessesWithPhone,
         withWebsite: businessesWithWebsite,
-        withReviews: businessesWithReviews,
         phonePercentage: `${itemCount ? ((businessesWithPhone / itemCount) * 100).toFixed(1) : '0.0'}%`,
-        websitePercentage: `${itemCount ? ((businessesWithWebsite / itemCount) * 100).toFixed(1) : '0.0'}%`,
         averageRating: parseFloat(avgRating.toFixed(2)),
     },
     searchQueries: validQueries,
-    configuration: {
-        maxResults,
-        includeReviews,
-        includeImages,
-        language,
-        maxConcurrency,
-        fastMode,
-    },
     timestamp: new Date().toISOString(),
     runtimeMs,
 };
