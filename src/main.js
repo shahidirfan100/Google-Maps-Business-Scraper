@@ -94,13 +94,11 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
 
         if (!name) return null;
 
-        // Build comprehensive business data
+        // Build comprehensive business data with ALL available fields
         const businessData = {
-            // Basic info
+            // Basic
             name,
             description: cleanText(ogDescription) || undefined,
-
-            // Category
             category: cleanText(
                 jsonLdData?.['@type'] ?
                     (Array.isArray(jsonLdData['@type']) ? jsonLdData['@type'].filter(t => t !== 'LocalBusiness')[0] : jsonLdData['@type']) :
@@ -112,13 +110,10 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
                 jsonLdData?.address?.streetAddress ||
                 (typeof jsonLdData?.address === 'string' ? jsonLdData.address : null)
             ) || undefined,
-
             city: cleanText(jsonLdData?.address?.addressLocality) || undefined,
             state: cleanText(jsonLdData?.address?.addressRegion) || undefined,
             postalCode: cleanText(jsonLdData?.address?.postalCode) || undefined,
             country: cleanText(jsonLdData?.address?.addressCountry) || undefined,
-
-            // Coordinates
             latitude: jsonLdData?.geo?.latitude || coords.latitude || undefined,
             longitude: jsonLdData?.geo?.longitude || coords.longitude || undefined,
 
@@ -130,24 +125,14 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
             rating: parseRating(jsonLdData?.aggregateRating?.ratingValue) || undefined,
             reviewsCount: parseReviewsCount(jsonLdData?.aggregateRating?.reviewCount) || undefined,
 
-            // Price
+            // Extras
             priceRange: cleanText(jsonLdData?.priceRange) || undefined,
-
-            // Hours
             openingHours: jsonLdData?.openingHours ?
                 (Array.isArray(jsonLdData.openingHours) ? jsonLdData.openingHours.join(', ') : jsonLdData.openingHours) :
                 undefined,
-
-            // Images
             mainImage: ogImage || jsonLdData?.image || undefined,
-
-            // Menu (for restaurants)
             menuUrl: jsonLdData?.hasMenu || jsonLdData?.menu || undefined,
-
-            // Reservations
             reservationUrl: jsonLdData?.acceptsReservations ? jsonLdData?.url : undefined,
-
-            // Social
             socialLinks: jsonLdData?.sameAs || undefined,
 
             // Meta
