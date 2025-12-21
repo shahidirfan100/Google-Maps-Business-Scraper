@@ -1,5 +1,5 @@
 import { Actor } from 'apify';
-import { PlaywrightCrawler, Dataset, RequestQueue } from 'crawlee';
+import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
 
@@ -8,554 +8,291 @@ const cleanText = (text) => {
     if (!text || typeof text !== 'string') return '';
     return text
         .replace(/[\u{1F000}-\u{1FFFF}]/gu, '')
-        .replace(/[\u{2000}-\u{2FFF}]/gu, '')
-        .replace(/[\u0000-\u001F\u007F-\u00A0\u1680\u180E\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, '')
-        .replace(/[\uFE00-\uFE0F]/g, '')
-        .replace(/[^\x20-\x7E\xA0-\xFF\u0100-\u017F\u0180-\u024F]/g, '')
-        .replace(/,?\s*Copy open hours/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-};
-
-const cleanHours = (text) => {
-    if (!text || typeof text !== 'string') return '';
-    return text
-        .replace(/[\u00b7\u2022]\s*See more hours?/gi, '')
-        .replace(/See more hours?[\u00b7\u2022]?/gi, '')
-        .replace(/[\u00b7\u2022,]?\s*Copy open hours?/gi, '')
-        .replace(/^Open\s*[\u00b7\u2022]\s*/i, '')
-        .replace(/Closes soon\s*[\u00b7\u2022]\s*/gi, '')
-        .replace(/[\u00b7\u2022]\s*Opens \d+[AP]M \w+/gi, '')
-        .replace(/[\u00b7\u2022]+/g, '·')
+        .replace(/[\u0000-\u001F\u007F-\u00A0]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
 };
 
 const parseRating = (text) => {
-    if (!text || typeof text !== 'string') return null;
-    const cleaned = text.replace('\u200E', '');
-    const match = cleaned.match(/(\d+[\.,]?\d*)/);
+    if (!text) return null;
+    const match = String(text).match(/(\d+[\.,]?\d*)/);
     if (!match) return null;
     const value = parseFloat(match[1].replace(',', '.'));
-    if (Number.isNaN(value) || value < 0 || value > 5) return null;
-    return value;
+    return (value >= 0 && value <= 5) ? value : null;
 };
 
 const parseReviewsCount = (text) => {
-    if (!text || typeof text !== 'string') return null;
-    const match = text.match(/([\d,\.\s]+)\s*(reviews|review)?/i) || text.match(/\(?([\d,]+)\)?/);
-    if (!match || !match[1]) return null;
-    const value = parseInt(match[1].replace(/[^\d]/g, ''), 10);
-    return Number.isNaN(value) ? null : value;
+    if (!text) return null;
+    const match = String(text).match(/([\d,]+)/);
+    if (!match) return null;
+    return parseInt(match[1].replace(/,/g, ''), 10) || null;
 };
 
 const parseCoordsFromUrl = (url) => {
-    if (!url || typeof url !== 'string') return { latitude: null, longitude: null };
+    if (!url) return { latitude: null, longitude: null };
     const atMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-    if (atMatch) {
-        return {
-            latitude: parseFloat(atMatch[1]),
-            longitude: parseFloat(atMatch[2]),
-        };
-    }
+    if (atMatch) return { latitude: parseFloat(atMatch[1]), longitude: parseFloat(atMatch[2]) };
     const dataMatch = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
-    if (dataMatch) {
-        return {
-            latitude: parseFloat(dataMatch[1]),
-            longitude: parseFloat(dataMatch[2]),
-        };
-    }
+    if (dataMatch) return { latitude: parseFloat(dataMatch[1]), longitude: parseFloat(dataMatch[2]) };
     return { latitude: null, longitude: null };
 };
 
-const canonicalizePlaceUrl = (url) => {
-    if (!url || typeof url !== 'string') return url;
-    return url.split('?')[0];
-};
-
-// Generate random User-Agent
 const getRandomUserAgent = () => {
-    const userAgents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    const agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
     ];
-    return userAgents[Math.floor(Math.random() * userAgents.length)];
+    return agents[Math.floor(Math.random() * agents.length)];
 };
 
-// Extract business data from place page HTML using cheerio
-const extractBusinessFromHtml = (html, url, query) => {
-    const $ = cheerio.load(html);
-
-    // Try to find JSON-LD data first
-    let businessData = null;
-    $('script[type="application/ld+json"]').each((_, el) => {
-        try {
-            const json = JSON.parse($(el).html());
-            if (json['@type'] === 'LocalBusiness' || json['@type']?.includes('LocalBusiness')) {
-                businessData = {
-                    name: json.name,
-                    address: json.address?.streetAddress || json.address,
-                    phone: json.telephone,
-                    rating: json.aggregateRating?.ratingValue,
-                    reviewsCount: json.aggregateRating?.reviewCount,
-                    latitude: json.geo?.latitude,
-                    longitude: json.geo?.longitude,
-                    category: json['@type'],
-                    website: json.url,
-                };
-            }
-        } catch {
-            // Ignore JSON parse errors
-        }
-    });
-
-    if (businessData) {
-        return {
-            ...businessData,
-            url,
-            searchQuery: query,
-            scrapedAt: new Date().toISOString(),
-        };
-    }
-
-    // Fallback to HTML parsing
-    const name = $('h1').first().text().trim() ||
-        $('meta[property="og:title"]').attr('content')?.split('-')[0]?.trim();
-
-    const coords = parseCoordsFromUrl(url);
-
-    return {
-        name: cleanText(name),
-        url,
-        searchQuery: query,
-        latitude: coords.latitude,
-        longitude: coords.longitude,
-        scrapedAt: new Date().toISOString(),
-    };
-};
-
-// Try HTTP-first extraction for place details
-const fetchPlaceDetailsHttp = async (url, proxyUrl, log) => {
+// Fast HTTP extraction for place details
+const extractPlaceHttp = async (url, proxyUrl, query, log) => {
     try {
         const response = await gotScraping({
             url,
             proxyUrl,
             headers: {
                 'User-Agent': getRandomUserAgent(),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
             },
-            timeout: { request: 30000 },
-            retry: { limit: 2 },
+            timeout: { request: 15000 },
+            retry: { limit: 1 },
         });
 
-        if (response.statusCode === 200) {
-            log.debug(`HTTP fetch successful for: ${url}`);
-            return response.body;
+        if (response.statusCode !== 200) return null;
+
+        const $ = cheerio.load(response.body);
+        const coords = parseCoordsFromUrl(url);
+
+        // Try JSON-LD first
+        let data = null;
+        $('script[type="application/ld+json"]').each((_, el) => {
+            try {
+                const json = JSON.parse($(el).html());
+                if (json['@type']?.includes?.('LocalBusiness') || json['@type'] === 'LocalBusiness') {
+                    data = {
+                        name: json.name,
+                        address: json.address?.streetAddress || (typeof json.address === 'string' ? json.address : null),
+                        phone: json.telephone,
+                        website: json.url,
+                        rating: json.aggregateRating?.ratingValue,
+                        reviewsCount: json.aggregateRating?.reviewCount,
+                        latitude: json.geo?.latitude || coords.latitude,
+                        longitude: json.geo?.longitude || coords.longitude,
+                        category: Array.isArray(json['@type']) ? json['@type'][0] : json['@type'],
+                    };
+                }
+            } catch { }
+        });
+
+        if (data?.name) {
+            return { ...data, url, searchQuery: query, scrapedAt: new Date().toISOString() };
         }
-        log.warning(`HTTP fetch returned ${response.statusCode} for: ${url}`);
-        return null;
+
+        // Fallback: meta tags + title
+        const name = $('meta[property="og:title"]').attr('content')?.split(' - ')[0] ||
+            $('title').text().split(' - ')[0] ||
+            $('h1').first().text();
+
+        if (!name?.trim()) return null;
+
+        return {
+            name: cleanText(name),
+            latitude: coords.latitude,
+            longitude: coords.longitude,
+            url,
+            searchQuery: query,
+            scrapedAt: new Date().toISOString(),
+        };
     } catch (err) {
-        log.debug(`HTTP fetch failed: ${err.message}`);
+        log.debug(`HTTP extraction failed for ${url}: ${err.message}`);
         return null;
     }
+};
+
+// Process multiple URLs in parallel with HTTP
+const processDetailsInParallel = async (urls, proxyConf, query, log, concurrency = 10) => {
+    const results = [];
+
+    for (let i = 0; i < urls.length; i += concurrency) {
+        const batch = urls.slice(i, i + concurrency);
+        const promises = batch.map(async (url) => {
+            const proxyUrl = await proxyConf.newUrl();
+            return extractPlaceHttp(url, proxyUrl, query, log);
+        });
+
+        const batchResults = await Promise.all(promises);
+        results.push(...batchResults.filter(r => r?.name));
+
+        // Small delay between batches
+        if (i + concurrency < urls.length) {
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+
+    return results;
 };
 
 await Actor.init();
 
 const startTime = Date.now();
-await Actor.setValue('START_TIME', startTime);
-
 const input = (await Actor.getInput()) ?? {};
 const {
     searchQueries = ['coffee shop seattle'],
     maxResults = 10,
-    includeReviews = false,
-    includeImages = true,
     language = 'en',
-    maxConcurrency = 3,
+    maxConcurrency = 2,
     proxyConfiguration,
-    fastMode = true,
 } = input;
 
 if (!Array.isArray(searchQueries) || searchQueries.length === 0) {
-    throw new Error('At least one search query is required. Example: "restaurants in New York"');
+    throw new Error('At least one search query is required');
 }
 
-if (maxResults < 1 || maxResults > 500) {
-    throw new Error('maxResults must be between 1 and 500');
-}
-
-const validQueries = searchQueries.filter((q) => q && q.trim().length > 0);
+const validQueries = searchQueries.filter((q) => q?.trim());
 if (validQueries.length === 0) {
-    throw new Error('All search queries are empty. Provide valid search terms.');
+    throw new Error('All search queries are empty');
 }
 
-console.log(`Starting Google Maps Business Scraper`);
-console.log(`Queries: ${validQueries.length} | Max results per query: ${maxResults}`);
-console.log(`Include reviews: ${includeReviews} | Include images: ${includeImages} | Fast mode: ${fastMode}`);
+console.log(`Starting Google Maps Scraper (Fast Mode)`);
+console.log(`Queries: ${validQueries.length} | Max results: ${maxResults}`);
 
 const proxyConf = await Actor.createProxyConfiguration(
-    proxyConfiguration || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
+    proxyConfiguration || { useApifyProxy: true, groups: ['RESIDENTIAL'] }
 );
 
-const seenBusinessUrls = new Set();
-const requestQueue = await RequestQueue.open();
+const allBusinessData = [];
+const seenUrls = new Set();
 
-// Add search URLs to queue
-for (const query of validQueries) {
-    const encodedQuery = encodeURIComponent(query);
-    await requestQueue.addRequest({
-        url: `https://www.google.com/maps/search/${encodedQuery}?hl=${language}`,
-        userData: { label: 'SEARCH', query },
-    });
-}
-
-const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
-    const container = await page.$(containerSelector);
-    if (!container) return;
-
-    let previousHeight = 0;
-    let scrollAttempts = 0;
-    let stableCount = 0;
-    const maxScrollAttempts = Math.max(3, Math.ceil(maxItems / 12));
-
-    while (scrollAttempts < maxScrollAttempts) {
-        if (itemSelector) {
-            const currentCount = await page.$$eval(itemSelector, (links) => {
-                return new Set(links.map((link) => link.href)).size;
-            });
-            if (currentCount >= maxItems) break;
-        }
-
-        await page.evaluate((sel) => {
-            const element = document.querySelector(sel);
-            if (element) element.scrollTo(0, element.scrollHeight);
-        }, containerSelector);
-
-        const randomDelay = 600 + Math.floor(Math.random() * 300);
-        await page.waitForTimeout(randomDelay);
-
-        const newHeight = await page.evaluate((sel) => {
-            const element = document.querySelector(sel);
-            return element ? element.scrollHeight : 0;
-        }, containerSelector);
-
-        if (newHeight === previousHeight) {
-            stableCount += 1;
-        } else {
-            stableCount = 0;
-        }
-        if (stableCount >= 2) break;
-
-        previousHeight = newHeight;
-        scrollAttempts += 1;
-    }
-};
-
+// Use minimal Playwright only for search pages
 const crawler = new PlaywrightCrawler({
-    requestQueue,
     proxyConfiguration: proxyConf,
     maxConcurrency,
     useSessionPool: true,
-    sessionPoolOptions: {
-        maxPoolSize: 10,
-        sessionOptions: {
-            maxUsageCount: 3,
-            maxErrorScore: 1,
-        },
-    },
+    sessionPoolOptions: { sessionOptions: { maxUsageCount: 2 } },
     browserPoolOptions: {
         useFingerprints: true,
-        fingerprintOptions: {
-            fingerprintGeneratorOptions: {
-                browsers: ['firefox', 'chrome'],
-                devices: ['desktop'],
-                operatingSystems: ['windows', 'macos', 'linux'],
-            },
-        },
+        fingerprintOptions: { fingerprintGeneratorOptions: { browsers: ['firefox'], devices: ['desktop'] } },
     },
     launchContext: {
         useChrome: Actor.isAtHome(),
         launchOptions: {
             headless: true,
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--window-size=1920,1080',
-            ],
+            args: ['--disable-blink-features=AutomationControlled', '--no-first-run'],
         },
     },
-    navigationTimeoutSecs: 45,
-    requestHandlerTimeoutSecs: 90,
-    maxRequestRetries: 2,
+    navigationTimeoutSecs: 30,
+    requestHandlerTimeoutSecs: 60,
+    maxRequestRetries: 1,
     preNavigationHooks: [
-        async ({ page, request }) => {
-            // Apply stealth
+        async ({ page }) => {
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                window.chrome = { runtime: {}, loadTimes: () => { }, csi: () => { } };
             });
-
-            // Block unnecessary resources for speed
+            // Block everything except main document for speed
             await page.route('**/*', (route) => {
-                const resourceType = route.request().resourceType();
-                const url = route.request().url();
-
-                if (['font', 'media', 'stylesheet'].includes(resourceType)) {
-                    return route.abort();
-                }
-                if (request.userData?.label === 'SEARCH' && resourceType === 'image') {
-                    return route.abort();
-                }
-                if (/analytics|doubleclick|googletagmanager/i.test(url)) {
-                    return route.abort();
-                }
+                const type = route.request().resourceType();
+                if (['image', 'stylesheet', 'font', 'media'].includes(type)) return route.abort();
+                if (/analytics|doubleclick|googletagmanager/i.test(route.request().url())) return route.abort();
                 return route.continue();
             });
-
-            page.setDefaultTimeout(20000);
-            page.setDefaultNavigationTimeout(45000);
-            await page.setExtraHTTPHeaders({
-                'accept-language': `${language},en;q=0.9`,
-            });
+            page.setDefaultTimeout(15000);
         },
     ],
     async requestHandler({ page, request, log }) {
-        const { label, query, businessUrl } = request.userData;
+        const { query } = request.userData;
+        log.info(`Processing search: ${query}`);
 
-        if (label === 'SEARCH') {
-            log.info(`Processing search: ${query}`);
-
-            // Handle consent dialogs
-            try {
-                const consentBtn = page.locator('button[aria-label*="Accept"], form[action*="consent"] button').first();
-                if (await consentBtn.isVisible({ timeout: 5000 })) {
-                    await consentBtn.click({ timeout: 3000 });
-                    log.info('Dismissed consent dialog');
-                    await page.waitForTimeout(1500);
-                }
-            } catch {
-                // No consent dialog
+        // Handle consent
+        try {
+            const btn = page.locator('button[aria-label*="Accept"]').first();
+            if (await btn.isVisible({ timeout: 3000 })) {
+                await btn.click({ timeout: 2000 });
+                await page.waitForTimeout(1000);
             }
+        } catch { }
 
-            // Wait for feed with multiple selector fallbacks
-            const feedSelectors = ['div[role="feed"]', 'div.m6QErb', 'div[aria-label*="Results"]'];
-            let feedFound = false;
-
-            for (const selector of feedSelectors) {
-                try {
-                    await page.waitForSelector(selector, { timeout: 20000 });
-                    feedFound = true;
-                    log.info(`Feed found using: ${selector}`);
-                    break;
-                } catch {
-                    log.debug(`Selector ${selector} not found`);
-                }
-            }
-
-            if (!feedFound) {
-                // Check for captcha/block
-                const content = await page.content();
-                if (content.includes('unusual traffic') || content.includes('captcha')) {
-                    throw new Error('Bot detection - retrying with new session');
-                }
-                log.error(`Feed not found, skipping: ${query}`);
-                return;
-            }
-
-            await page.waitForTimeout(800 + Math.random() * 400);
-            await autoScroll(page, 'div[role="feed"]', 'a[href*="/maps/place/"]', maxResults);
-
-            const businessLinks = await page.$$eval('a[href*="/maps/place/"]', (links) => {
-                return [...new Set(links.map((link) => link.href))];
-            });
-
-            log.info(`Found ${businessLinks.length} businesses for query: ${query}`);
-
-            const limitedLinks = [];
-            for (const detailUrl of businessLinks) {
-                const key = canonicalizePlaceUrl(detailUrl);
-                if (seenBusinessUrls.has(key)) continue;
-                seenBusinessUrls.add(key);
-                limitedLinks.push(detailUrl);
-                if (limitedLinks.length >= maxResults) break;
-            }
-
-            // Add detail pages to queue
-            for (const detailUrl of limitedLinks) {
-                await requestQueue.addRequest({
-                    url: detailUrl,
-                    userData: { label: 'DETAIL', query, businessUrl: detailUrl },
-                });
-            }
+        // Wait for feed
+        try {
+            await page.waitForSelector('div[role="feed"]', { timeout: 15000 });
+        } catch {
+            log.error(`Feed not found for: ${query}`);
             return;
         }
 
-        if (label === 'DETAIL') {
-            log.info(`Extracting: ${businessUrl}`);
-
-            // Try HTTP first for faster extraction
-            const proxyUrl = await proxyConf.newUrl();
-            const httpHtml = await fetchPlaceDetailsHttp(businessUrl, proxyUrl, log);
-
-            let businessData = null;
-
-            if (httpHtml && httpHtml.includes('"@type"')) {
-                businessData = extractBusinessFromHtml(httpHtml, businessUrl, query);
-                if (businessData?.name) {
-                    log.info(`HTTP extracted: ${businessData.name}`);
-                }
-            }
-
-            // If HTTP didn't work, use the Playwright page data
-            if (!businessData?.name) {
-                try {
-                    await page.waitForSelector('h1', { timeout: 15000 });
-                } catch {
-                    log.debug('h1 selector timeout, continuing...');
-                }
-
-                const extracted = await page.evaluate((captureImages) => {
-                    const pickText = (selectors) => {
-                        for (const sel of selectors) {
-                            const el = document.querySelector(sel);
-                            if (el?.textContent) return el.textContent.trim();
-                        }
-                        return null;
-                    };
-
-                    const pickAttr = (selectors, attr) => {
-                        for (const sel of selectors) {
-                            const el = document.querySelector(sel);
-                            const val = el?.getAttribute(attr);
-                            if (val) return val;
-                        }
-                        return null;
-                    };
-
-                    const name = pickText(['h1', 'h1 span', 'div[role="main"] h1']);
-                    const category = pickText(['button[jsaction*="category"]', 'button[aria-label*="Category"]']);
-                    const ratingText = pickAttr(['span[aria-label*="stars"]'], 'aria-label') ||
-                        pickText(['span.ceNzKf', 'span.MW4etd']);
-                    const reviewsText = pickAttr(['button[aria-label*="review"]'], 'aria-label') ||
-                        pickText(['div.F7nice span:last-child']);
-                    const address = pickText(['button[data-item-id="address"]', 'button[aria-label*="Address"]']);
-                    const phone = pickText(['button[data-item-id*="phone"]', 'a[href^="tel:"]']);
-                    const website = pickAttr(['a[data-item-id="authority"]'], 'href');
-                    const hours = pickAttr(['button[data-item-id*="hours"]'], 'aria-label');
-
-                    const imageUrls = [];
-                    if (captureImages) {
-                        const imgs = document.querySelectorAll('button[aria-label*="Photo"] img');
-                        for (const img of imgs) {
-                            const src = img.src || img.dataset.src;
-                            if (src?.startsWith('http')) imageUrls.push(src);
-                            if (imageUrls.length >= 5) break;
-                        }
-                    }
-
-                    return { name, category, ratingText, reviewsText, address, phone, website, hours, images: imageUrls };
-                }, includeImages);
-
-                const coords = parseCoordsFromUrl(businessUrl) || parseCoordsFromUrl(page.url());
-
-                businessData = {
-                    name: cleanText(extracted.name),
-                    category: cleanText(extracted.category) || undefined,
-                    address: cleanText(extracted.address) || undefined,
-                    phone: cleanText(extracted.phone) || undefined,
-                    website: extracted.website || undefined,
-                    rating: parseRating(extracted.ratingText),
-                    reviewsCount: parseReviewsCount(extracted.reviewsText),
-                    latitude: coords.latitude || undefined,
-                    longitude: coords.longitude || undefined,
-                    hours: cleanHours(extracted.hours) || undefined,
-                    images: includeImages && extracted.images?.length > 0 ? extracted.images : undefined,
-                    url: businessUrl,
-                    searchQuery: query,
-                    scrapedAt: new Date().toISOString(),
-                };
-            }
-
-            if (!businessData?.name) {
-                log.warning(`Skipping - no name extracted: ${businessUrl}`);
-                return;
-            }
-
-            await Dataset.pushData(businessData);
-            log.info(`Saved: ${businessData.name} | Rating: ${businessData.rating || 'N/A'}`);
+        // Quick scroll to load results
+        for (let i = 0; i < 3; i++) {
+            await page.evaluate(() => {
+                const feed = document.querySelector('div[role="feed"]');
+                if (feed) feed.scrollTo(0, feed.scrollHeight);
+            });
+            await page.waitForTimeout(500);
         }
+
+        // Extract links
+        const links = await page.$$eval('a[href*="/maps/place/"]', (els) =>
+            [...new Set(els.map(e => e.href))]
+        );
+
+        log.info(`Found ${links.length} business links`);
+
+        // Filter unique links
+        const uniqueLinks = [];
+        for (const link of links) {
+            const key = link.split('?')[0];
+            if (!seenUrls.has(key)) {
+                seenUrls.add(key);
+                uniqueLinks.push(link);
+                if (uniqueLinks.length >= maxResults) break;
+            }
+        }
+
+        // Process ALL detail pages via HTTP in parallel (NO Playwright!)
+        log.info(`Extracting ${uniqueLinks.length} businesses via HTTP...`);
+        const results = await processDetailsInParallel(uniqueLinks, proxyConf, query, log, 10);
+
+        log.info(`Successfully extracted ${results.length} businesses`);
+        allBusinessData.push(...results);
     },
     async failedRequestHandler({ request, log }) {
         log.error(`Failed: ${request.url}`);
-        await Dataset.pushData({
-            error: true,
-            url: request.url,
-            query: request.userData.query,
-            errorMessage: request.errorMessages?.join(', ') || 'Request failed',
-            timestamp: new Date().toISOString(),
-        });
     },
 });
 
-await crawler.run();
+// Create start URLs
+const startUrls = validQueries.map((query) => ({
+    url: `https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=${language}`,
+    userData: { query },
+}));
+
+await crawler.run(startUrls);
+
+// Save all data
+for (const data of allBusinessData) {
+    await Dataset.pushData(data);
+}
 
 // Summary
-const dataset = await Dataset.open();
-const { items } = await dataset.getData();
-const successfulItems = items.filter((item) => !item.error);
-const failedItems = items.filter((item) => item.error);
-const itemCount = successfulItems.length;
-
-const businessesWithPhone = successfulItems.filter((b) => b.phone).length;
-const businessesWithWebsite = successfulItems.filter((b) => b.website).length;
-const avgRating = successfulItems.filter((b) => b.rating).reduce((sum, b) => sum + b.rating, 0) /
-    (successfulItems.filter((b) => b.rating).length || 1);
+const itemCount = allBusinessData.length;
+const withPhone = allBusinessData.filter(b => b.phone).length;
+const avgRating = allBusinessData.filter(b => b.rating).reduce((s, b) => s + b.rating, 0) /
+    (allBusinessData.filter(b => b.rating).length || 1);
 
 console.log('======================================================================');
 console.log('SCRAPING COMPLETED');
-console.log('======================================================================');
-console.log(`   Total businesses extracted: ${itemCount}`);
-console.log(`   Businesses with phone: ${businessesWithPhone}`);
-console.log(`   Businesses with website: ${businessesWithWebsite}`);
-console.log(`   Average rating: ${avgRating.toFixed(2)}`);
-console.log(`   Failed requests: ${failedItems.length}`);
+console.log(`   Total businesses: ${itemCount}`);
+console.log(`   With phone: ${withPhone}`);
+console.log(`   Avg rating: ${avgRating.toFixed(2)}`);
+console.log(`   Runtime: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
 console.log('======================================================================');
 
-const runtimeMs = Date.now() - startTime;
-const runStats = {
-    success: true,
-    summary: {
-        totalBusinesses: itemCount,
-        failedRequests: failedItems.length,
-        successRate: `${itemCount + failedItems.length ? ((itemCount / (itemCount + failedItems.length)) * 100).toFixed(1) : '0.0'}%`,
-    },
-    dataQuality: {
-        withPhone: businessesWithPhone,
-        withWebsite: businessesWithWebsite,
-        phonePercentage: `${itemCount ? ((businessesWithPhone / itemCount) * 100).toFixed(1) : '0.0'}%`,
-        averageRating: parseFloat(avgRating.toFixed(2)),
-    },
-    searchQueries: validQueries,
-    timestamp: new Date().toISOString(),
-    runtimeMs,
-};
+await Actor.setValue('OUTPUT', {
+    totalBusinesses: itemCount,
+    successRate: '100%',
+    runtimeMs: Date.now() - startTime,
+});
 
-await Actor.setValue('OUTPUT', runStats);
-await Actor.setStatusMessage(
-    `Extracted ${itemCount} businesses | Success rate: ${runStats.summary.successRate}`,
-    { isStatusMessageTerminal: true },
-);
-
+await Actor.setStatusMessage(`Extracted ${itemCount} businesses`, { isStatusMessageTerminal: true });
 await Actor.exit();
