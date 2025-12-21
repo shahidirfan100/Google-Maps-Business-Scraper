@@ -165,8 +165,10 @@ const crawler = new PlaywrightCrawler({
     maxConcurrency,
     useSessionPool: true,
     sessionPoolOptions: {
+        maxPoolSize: 10,
         sessionOptions: {
-            maxUsageCount: 12,
+            maxUsageCount: 5,
+            maxErrorScore: 1,
         },
     },
     browserPoolOptions: {
@@ -184,22 +186,77 @@ const crawler = new PlaywrightCrawler({
         launchOptions: {
             headless: true,
             devtools: false,
-            args: ['--disable-blink-features=AutomationControlled'],
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials',
+                '--disable-web-security',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--window-size=1920,1080',
+            ],
         },
     },
     navigationTimeoutSecs: 60,
     requestHandlerTimeoutSecs: 120,
-    maxRequestRetries: 1,
+    maxRequestRetries: 2,
     maxRequestsPerCrawl: maxResults * validQueries.length + 100,
     preNavigationHooks: [
         async ({ page, request }) => {
             if (!page.__gmapsStealthInit) {
                 page.__gmapsStealthInit = true;
                 await page.addInitScript(() => {
+                    // Hide webdriver
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    delete navigator.__proto__.webdriver;
+
+                    // Set realistic languages
                     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    window.chrome = { runtime: {} };
+
+                    // Fake plugins array
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => {
+                            const plugins = [
+                                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                                { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                            ];
+                            plugins.length = 3;
+                            return plugins;
+                        }
+                    });
+
+                    // Set proper platform
+                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+                    // Hide automation indicators
+                    window.chrome = {
+                        runtime: {},
+                        loadTimes: () => { },
+                        csi: () => { },
+                        app: {}
+                    };
+
+                    // Prevent detection via permissions
+                    const originalQuery = window.navigator.permissions?.query;
+                    if (originalQuery) {
+                        window.navigator.permissions.query = (parameters) => {
+                            if (parameters.name === 'notifications') {
+                                return Promise.resolve({ state: 'denied', onchange: null });
+                            }
+                            return originalQuery(parameters);
+                        };
+                    }
+
+                    // Set realistic screen properties
+                    Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+                    Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+                    Object.defineProperty(screen, 'width', { get: () => 1920 });
+                    Object.defineProperty(screen, 'height', { get: () => 1080 });
+                    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
                 });
 
                 await page.route('**/*', (route) => {
@@ -245,16 +302,78 @@ const crawler = new PlaywrightCrawler({
         if (label === 'SEARCH') {
             log.info(`Processing search: ${query}`);
 
+            // Handle Google consent dialog/cookie popup
             try {
-                await page.waitForSelector('div[role="feed"]', { timeout: 60000 });
+                const consentSelectors = [
+                    'button[aria-label*="Accept all"]',
+                    'button[aria-label*="Reject all"]',
+                    'form[action*="consent"] button',
+                    'button:has-text("Accept all")',
+                    'button:has-text("Reject all")',
+                    '[aria-label="Accept all"]',
+                    'button.VfPpkd-LgbsSe[jsname]',
+                ];
+
+                for (const selector of consentSelectors) {
+                    try {
+                        const consentBtn = page.locator(selector).first();
+                        if (await consentBtn.isVisible({ timeout: 3000 })) {
+                            await consentBtn.click({ timeout: 5000 });
+                            log.info('Dismissed consent dialog');
+                            await page.waitForTimeout(2000);
+                            break;
+                        }
+                    } catch {
+                        // Ignore - try next selector
+                    }
+                }
             } catch (err) {
-                log.warning(`Feed selector timeout after 60s: ${err.message}`);
-                const feedExists = await page.$('div[role="feed"]');
-                if (!feedExists) {
-                    log.error(`Feed not found, skipping query: ${query}`);
+                log.debug(`Consent dialog check: ${err.message}`);
+            }
+
+            // Wait for page to stabilize after potential consent handling
+            await page.waitForLoadState('domcontentloaded');
+
+            // Try multiple selectors for the results feed
+            const feedSelectors = [
+                'div[role="feed"]',
+                'div[role="main"] div[role="feed"]',
+                'div.m6QErb[role="feed"]',
+                'div[aria-label*="Results"]',
+            ];
+
+            let feedFound = false;
+            for (const selector of feedSelectors) {
+                try {
+                    await page.waitForSelector(selector, { timeout: 30000 });
+                    feedFound = true;
+                    log.info(`Feed found using selector: ${selector}`);
+                    break;
+                } catch {
+                    log.debug(`Selector ${selector} not found, trying next...`);
+                }
+            }
+
+            if (!feedFound) {
+                // Check if we got blocked or page didn't load properly
+                const pageContent = await page.content();
+                if (pageContent.includes('unusual traffic') || pageContent.includes('captcha')) {
+                    log.error('Detected CAPTCHA or bot detection, session likely blocked');
+                    throw new Error('Bot detection triggered');
+                }
+
+                // Try clicking search button if needed
+                const searchBox = await page.$('input[aria-label*="Search"]');
+                if (searchBox) {
+                    await searchBox.press('Enter');
+                    await page.waitForTimeout(3000);
+                    feedFound = await page.$('div[role="feed"]') !== null;
+                }
+
+                if (!feedFound) {
+                    log.error(`Feed not found after all attempts, skipping query: ${query}`);
                     return;
                 }
-                log.info('Feed found despite timeout, proceeding...');
             }
 
             const randomWait = 1000 + Math.floor(Math.random() * 500);
