@@ -57,8 +57,8 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
                 'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'en-US,en;q=0.9',
             },
-            timeout: { request: 20000 },
-            retry: { limit: 2 },
+            timeout: { request: 8000 },
+            retry: { limit: 1 },
         });
 
         if (response.statusCode !== 200) return null;
@@ -148,30 +148,45 @@ const extractPlaceHttp = async (url, proxyUrl, query, log) => {
 
         return businessData;
     } catch (err) {
-        log.debug(`HTTP extraction failed for ${url}: ${err.message}`);
+        log.warning(`HTTP extraction failed for ${url.substring(0, 100)}: ${err.message}`);
         return null;
     }
 };
 
 // Process multiple URLs in parallel with HTTP
-const processDetailsInParallel = async (urls, proxyConf, query, log, concurrency = 10) => {
+const processDetailsInParallel = async (urls, proxyConf, query, log, concurrency = 5) => {
     const results = [];
+    log.info(`Starting extraction of ${urls.length} URLs (concurrency: ${concurrency})`);
 
     for (let i = 0; i < urls.length; i += concurrency) {
         const batch = urls.slice(i, i + concurrency);
+        const batchNum = Math.floor(i / concurrency) + 1;
+        log.info(`Batch ${batchNum}: Processing ${batch.length} URLs`);
+
         const promises = batch.map(async (url) => {
-            const proxyUrl = await proxyConf.newUrl();
-            return extractPlaceHttp(url, proxyUrl, query, log);
+            try {
+                const proxyUrl = await proxyConf.newUrl();
+                return await extractPlaceHttp(url, proxyUrl, query, log);
+            } catch (err) {
+                log.error(`Batch error: ${err.message}`);
+                return null;
+            }
         });
 
-        const batchResults = await Promise.all(promises);
-        results.push(...batchResults.filter(r => r?.name));
+        const batchResults = await Promise.allSettled(promises);
+        const successful = batchResults
+            .filter(r => r.status === 'fulfilled' && r.value?.name)
+            .map(r => r.value);
+
+        results.push(...successful);
+        log.info(`Batch ${batchNum} done: ${successful.length}/${batch.length} successful`);
 
         if (i + concurrency < urls.length) {
-            await new Promise(r => setTimeout(r, 150));
+            await new Promise(r => setTimeout(r, 100));
         }
     }
 
+    log.info(`Extraction complete: ${results.length}/${urls.length} total`);
     return results;
 };
 
@@ -229,7 +244,7 @@ const crawler = new PlaywrightCrawler({
         },
     },
     navigationTimeoutSecs: 30,
-    requestHandlerTimeoutSecs: 90,
+    requestHandlerTimeoutSecs: 150,
     maxRequestRetries: 2,
     preNavigationHooks: [
         async ({ page }) => {
