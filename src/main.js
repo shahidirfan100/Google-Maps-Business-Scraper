@@ -92,7 +92,8 @@ const autoScroll = async (page, containerSelector, itemSelector, maxItems) => {
             if (element) element.scrollTo(0, element.scrollHeight);
         }, containerSelector);
 
-        await page.waitForTimeout(900);
+        const randomDelay = 800 + Math.floor(Math.random() * 400);
+        await page.waitForTimeout(randomDelay);
 
         const newHeight = await page.evaluate((sel) => {
             const element = document.querySelector(sel);
@@ -123,7 +124,7 @@ const {
     includeReviews = false,
     includeImages = true,
     language = 'en',
-    maxConcurrency = 5,
+    maxConcurrency = 3,
     proxyConfiguration,
     fastMode = true,
 } = input;
@@ -186,9 +187,9 @@ const crawler = new PlaywrightCrawler({
             args: ['--disable-blink-features=AutomationControlled'],
         },
     },
-    navigationTimeoutSecs: 45,
-    requestHandlerTimeoutSecs: 90,
-    maxRequestRetries: 2,
+    navigationTimeoutSecs: 60,
+    requestHandlerTimeoutSecs: 120,
+    maxRequestRetries: 1,
     maxRequestsPerCrawl: maxResults * validQueries.length + 100,
     preNavigationHooks: [
         async ({ page, request }) => {
@@ -204,23 +205,35 @@ const crawler = new PlaywrightCrawler({
                 await page.route('**/*', (route) => {
                     const resourceType = route.request().resourceType();
                     const url = route.request().url();
-                    if (resourceType === 'font' || resourceType === 'media' || resourceType === 'stylesheet') {
+
+                    // Block unnecessary resources for speed and cost optimization
+                    if (['font', 'media', 'stylesheet'].includes(resourceType)) {
                         return route.abort();
                     }
+
+                    // Block images in fast mode or on search pages
                     if (page.__gmapsBlockImages && resourceType === 'image') {
                         return route.abort();
                     }
+
+                    // Block review-related XHR if not collecting reviews
                     if (!includeReviews && resourceType === 'xhr' && /review/i.test(url)) {
                         return route.abort();
                     }
+
+                    // Block analytics and tracking
+                    if (/analytics|doubleclick|google-analytics|googletagmanager/i.test(url)) {
+                        return route.abort();
+                    }
+
                     return route.continue();
                 });
             }
 
             page.__gmapsBlockImages = fastMode || !includeImages || request.userData?.label === 'SEARCH';
 
-            page.setDefaultTimeout(12000);
-            page.setDefaultNavigationTimeout(45000);
+            page.setDefaultTimeout(15000);
+            page.setDefaultNavigationTimeout(60000);
             await page.setExtraHTTPHeaders({
                 'accept-language': language ? `${language},en;q=0.8` : 'en-US,en;q=0.8',
             });
@@ -231,8 +244,21 @@ const crawler = new PlaywrightCrawler({
 
         if (label === 'SEARCH') {
             log.info(`Processing search: ${query}`);
-            await page.waitForSelector('div[role="feed"]', { timeout: 30000 });
-            await page.waitForTimeout(1200);
+
+            try {
+                await page.waitForSelector('div[role="feed"]', { timeout: 60000 });
+            } catch (err) {
+                log.warning(`Feed selector timeout after 60s: ${err.message}`);
+                const feedExists = await page.$('div[role="feed"]');
+                if (!feedExists) {
+                    log.error(`Feed not found, skipping query: ${query}`);
+                    return;
+                }
+                log.info('Feed found despite timeout, proceeding...');
+            }
+
+            const randomWait = 1000 + Math.floor(Math.random() * 500);
+            await page.waitForTimeout(randomWait);
             await autoScroll(page, 'div[role="feed"]', 'a[href*="/maps/place/"]', maxResults);
 
             const businessLinks = await page.$$eval('a[href*="/maps/place/"]', (links) => {
@@ -264,7 +290,7 @@ const crawler = new PlaywrightCrawler({
             log.info(`Extracting business details from: ${businessUrl}`);
 
             try {
-                await page.waitForSelector('h1', { timeout: 12000 });
+                await page.waitForSelector('h1', { timeout: 15000 });
             } catch (err) {
                 log.debug(`Heading wait timed out: ${err.message}`);
             }
@@ -430,8 +456,7 @@ const crawler = new PlaywrightCrawler({
 
             await Dataset.pushData(businessData);
             log.info(
-                `Saved: ${businessData.name} | Rating: ${businessData.rating || 'N/A'} | Reviews: ${
-                    businessData.reviewsCount || 'N/A'
+                `Saved: ${businessData.name} | Rating: ${businessData.rating || 'N/A'} | Reviews: ${businessData.reviewsCount || 'N/A'
                 }`,
             );
         }
@@ -461,7 +486,7 @@ const businessesWithWebsite = successfulItems.filter((b) => b.website).length;
 const businessesWithReviews = successfulItems.filter((b) => b.reviewsCount && b.reviewsCount > 0).length;
 const avgRating =
     successfulItems.filter((b) => b.rating).reduce((sum, b) => sum + b.rating, 0) /
-        (successfulItems.filter((b) => b.rating).length || 1);
+    (successfulItems.filter((b) => b.rating).length || 1);
 
 console.log('======================================================================');
 console.log('SCRAPING COMPLETED');

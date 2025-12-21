@@ -13,11 +13,9 @@
         "type": "string"
       },
       "default": [
-        "cardiologist",
         "coffee shop seattle"
       ],
       "prefill": [
-        "cardiologist",
         "coffee shop seattle"
       ]
     },
@@ -27,8 +25,8 @@
       "description": "Maximum businesses to extract for each query (1-500).",
       "minimum": 1,
       "maximum": 500,
-      "default": 20,
-      "prefill": 20,
+      "default": 10,
+      "prefill": 10,
       "editor": "number"
     },
     "includeReviews": {
@@ -60,9 +58,17 @@
       "type": "integer",
       "description": "Parallel browser pages (balance speed vs. blocking).",
       "minimum": 1,
-      "default": 5,
-      "prefill": 5,
+      "default": 3,
+      "prefill": 3,
       "editor": "number"
+    },
+    "fastMode": {
+      "title": "Fast Mode",
+      "type": "boolean",
+      "description": "Skip loading images on search pages for faster performance and lower costs.",
+      "default": true,
+      "prefill": true,
+      "editor": "checkbox"
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
@@ -83,5 +89,7 @@
       }
     }
   },
-  "required": ["searchQueries"]
+  "required": [
+    "searchQueries"
+  ]
 }
